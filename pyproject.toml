@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contour-research"
-version = "0.1.0"
+version = "0.2.0"
 description = "Topographical & Epistemic ML Research Framework (Expeditions, Cairns, FieldLogs)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,11 +14,11 @@ dependencies = [
 
 [project.optional-dependencies]
 aim = ["aim>=3.17.0"]
+dev = ["pytest>=8.0.0"]
 
 [project.scripts]
-contour = "contour:main"
-cr = "contour:main"
+contour = "contour.cli:main"
+cr = "contour.cli:main"
 
-[tool.setuptools]
-package-dir = {"" = "tools"}
-py-modules = ["contour", "theodolite"]
+[tool.setuptools.packages.find]
+where = ["src"]
