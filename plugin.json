@@ -3,7 +3,7 @@
   "displayName": "Contour ML Research",
   "version": "0.2.0",
   "description": "Lightweight epistemic ML research framework: ingest training runs, auto-compute controlled parent diffs, and generate next experiment candidates across any repository.",
-  "logo": "assets/logo.svg",
+  "logo": "assets/icon.jpg",
   "suggestedPrompts": [
     "Initialize Contour in this repo and set up our first expedition and cairn",
     "Sync the latest training runs and check for confounded comparisons",

@@ -1,4 +1,6 @@
-# Contour — Lightweight Epistemic ML Research Framework
+# Contour — Survey and Map Your ML Research Landscape
+
+![Contour Banner](assets/banner.jpg)
 
 **Contour** maintains an easily navigable research state built on top of many training runs, designed for both human researchers and AI agents using plain Markdown and Git.
 
