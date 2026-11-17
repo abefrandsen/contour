@@ -1,4 +1,4 @@
-"""Markdown + YAML frontmatter I/O and Obsidian wikilink helpers."""
+"""Markdown + YAML frontmatter I/O and wikilink helpers."""
 
 from __future__ import annotations
 

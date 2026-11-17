@@ -24,6 +24,18 @@ class TestConfigAndDrift(unittest.TestCase):
         nested.mkdir(parents=True)
         self.assertEqual(find_root(start=nested), self.root.resolve())
 
+    def test_find_root_discovers_contour_subdirectory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            sub = repo / "contour"
+            sub.mkdir()
+            (sub / CONFIG_FILE).write_text("contour: 1\n", encoding="utf-8")
+            self.assertEqual(find_root(start=repo), sub.resolve())
+            self.assertEqual(find_root(explicit=repo), sub.resolve())
+            src_dir = repo / "src" / "models"
+            src_dir.mkdir(parents=True)
+            self.assertEqual(find_root(start=src_dir), sub.resolve())
+
     def test_invalid_config_raises(self) -> None:
         (self.root / CONFIG_FILE).write_text("contour: 99\n", encoding="utf-8")
         with self.assertRaises(ConfigError):

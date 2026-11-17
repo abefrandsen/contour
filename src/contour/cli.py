@@ -14,7 +14,7 @@ import yaml
 
 from .bundle import BundleError, SCHEMA_ID
 from .compare import compare_runs
-from .config import CONFIG_FILE, DEFAULT_CONFIG, ConfigError, find_root, load_config
+from .config import CONFIG_FILE, DEFAULT_CONFIG, SUBDIR_CANDIDATES, ConfigError, find_root, load_config
 from .drift import ERROR, find_drift_issues, get_or_compute_vs_parent
 from .graph import EDGE_KEYS, ContourGraph, ContourNode
 from .haze import load_haze, seed_haze_from_runs
@@ -38,10 +38,67 @@ def _emit_json(obj: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def cmd_init(target: Path, as_json: bool = False) -> None:
-    target = target.resolve()
-    target.mkdir(parents=True, exist_ok=True)
-    cfg_path = target / CONFIG_FILE
+def _bundled_skill_markdown() -> str:
+    repo_skill = Path(__file__).resolve().parent.parent.parent / ".agent" / "skills" / "contour-research" / "SKILL.md"
+    if repo_skill.exists():
+        return repo_skill.read_text(encoding="utf-8")
+    return (
+        "---\n"
+        "name: contour-research\n"
+        "description: Navigate, survey, and reason over the Contour ML Epistemic Graph (Expeditions, Cairns, and FieldLogs).\n"
+        "---\n\n"
+        "# Contour: Epistemic ML Research Copilot Skill\n\n"
+        "Run `contour map --json`, `contour bearings --json`, `contour ridge --json`, `contour drift --json`, "
+        "and `contour inspect <node_id>` to navigate the research state and propose next experiments.\n"
+    )
+
+
+def _eject_standalone_logger(dest: Path) -> Path:
+    pkg_dir = Path(__file__).resolve().parent
+    bundle_src = (pkg_dir / "bundle.py").read_text(encoding="utf-8")
+    theo_src = (pkg_dir / "theodolite.py").read_text(encoding="utf-8")
+    # Strip relative imports in theodolite.py so it runs as a single standalone stdlib-only file
+    theo_lines = [
+        ln for ln in theo_src.splitlines()
+        if not ln.startswith("from .bundle import") and not ln.startswith("from .config import")
+    ]
+    combined = (
+        '"""Standalone zero-dependency Contour Run logger (ejected via `contour init --eject-logger`)."""\n\n'
+        + bundle_src
+        + "\n\nclass ConfigError(ValueError):\n    pass\n\n"
+        + "def find_root(start=None, explicit=None):\n"
+        + "    cur = (start or Path.cwd()).resolve()\n"
+        + "    for d in (cur, *cur.parents):\n"
+        + "        if (d / 'contour.yaml').exists(): return d\n"
+        + "        for sub in ('contour', '.contour', 'research'):\n"
+        + "            if (d / sub / 'contour.yaml').exists(): return d / sub\n"
+        + "    raise ConfigError('No contour.yaml found')\n\n"
+        + "\n".join(theo_lines)
+        + "\n"
+    )
+    out_path = (dest / "contour_run.py") if dest.is_dir() else dest
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(combined, encoding="utf-8")
+    return out_path
+
+
+def cmd_init(
+    target: Path | None,
+    with_skill: bool = False,
+    eject_logger: Path | None = None,
+    as_json: bool = False,
+) -> None:
+    if target is None:
+        cwd = Path.cwd().resolve()
+        if (cwd / CONFIG_FILE).exists() or cwd.name in SUBDIR_CANDIDATES:
+            resolved = cwd
+        else:
+            resolved = cwd / "contour"
+    else:
+        resolved = target.resolve()
+
+    resolved.mkdir(parents=True, exist_ok=True)
+    cfg_path = resolved / CONFIG_FILE
     created_cfg = False
     if not cfg_path.exists():
         data = copy.deepcopy(DEFAULT_CONFIG)
@@ -52,13 +109,33 @@ def cmd_init(target: Path, as_json: bool = False) -> None:
         created_cfg = True
 
     for sub in ("expeditions", "cairns", "fieldlogs", "bundles", "field_bundles"):
-        (target / sub).mkdir(exist_ok=True)
+        (resolved / sub).mkdir(exist_ok=True)
+
+    skill_path: Path | None = None
+    if with_skill:
+        repo_base = resolved.parent if resolved.name in SUBDIR_CANDIDATES else resolved
+        skill_path = repo_base / ".agent" / "skills" / "contour-research" / "SKILL.md"
+        skill_path.parent.mkdir(parents=True, exist_ok=True)
+        skill_path.write_text(_bundled_skill_markdown(), encoding="utf-8")
+
+    logger_path: Path | None = None
+    if eject_logger is not None:
+        logger_path = _eject_standalone_logger(eject_logger.resolve())
 
     if as_json:
-        _emit_json({"root": str(target), "created_config": created_cfg})
+        _emit_json({
+            "root": str(resolved),
+            "created_config": created_cfg,
+            **({"skill_path": str(skill_path)} if skill_path else {}),
+            **({"ejected_logger": str(logger_path)} if logger_path else {}),
+        })
         return
     status = "Created" if created_cfg else "Initialized"
-    print(f"{status} Contour root at {target}")
+    print(f"{status} Contour root at {resolved}")
+    if skill_path:
+        print(f"Installed agent skill at {skill_path}")
+    if logger_path:
+        print(f"Ejected standalone stdlib logger at {logger_path}")
 
 
 def cmd_map(g: ContourGraph, as_json: bool = False) -> None:
@@ -935,8 +1012,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", dest="as_json", action="store_true", help="Emit machine-readable JSON")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_init = sub.add_parser("init", parents=[common], help="Initialize a Contour root (creates contour.yaml and folders)")
-    p_init.add_argument("path", nargs="?", type=Path, default=Path("."), help="Target directory (default: .)")
+    p_init = sub.add_parser("init", parents=[common], help="Initialize a Contour root (defaults to ./contour/ subdirectory)")
+    p_init.add_argument("path", nargs="?", type=Path, default=None, help="Target directory (default: ./contour, or . if passed)")
+    p_init.add_argument("--with-skill", action="store_true", help="Write .agent/skills/contour-research/SKILL.md into the repo")
+    p_init.add_argument(
+        "--eject-logger",
+        nargs="?",
+        const=Path("contour_run.py"),
+        default=None,
+        type=Path,
+        help="Write a standalone stdlib-only contour_run.py logger for external cluster/Docker jobs",
+    )
 
     sub.add_parser("map", parents=[common], aliases=["overview"], help="Print the Expedition -> Cairn -> FieldLog DAG")
 
@@ -990,7 +1076,12 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.cmd == "init":
-        cmd_init(args.path, as_json=args.as_json)
+        cmd_init(
+            args.path,
+            with_skill=args.with_skill,
+            eject_logger=args.eject_logger,
+            as_json=args.as_json,
+        )
         return
 
     try:

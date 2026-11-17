@@ -12,6 +12,7 @@ import yaml
 
 CONFIG_FILE = "contour.yaml"
 CONFIG_VERSION = 1
+SUBDIR_CANDIDATES = ("contour", ".contour", "research")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "contour": CONFIG_VERSION,
@@ -82,12 +83,16 @@ def validate_config(data: dict[str, Any]) -> list[str]:
 
 
 def find_root(start: Path | None = None, explicit: Path | None = None) -> Path:
-    """Locate the Contour root: --root > $CONTOUR_ROOT > nearest ancestor containing contour.yaml."""
+    """Locate the Contour root: --root > $CONTOUR_ROOT > nearest ancestor (or its contour/ subdir) containing contour.yaml."""
     if explicit is not None:
         root = explicit.resolve()
-        if not (root / CONFIG_FILE).exists():
-            raise ConfigError(f"{root} has no {CONFIG_FILE}. Run `contour init` there first.")
-        return root
+        if (root / CONFIG_FILE).exists():
+            return root
+        for sub in SUBDIR_CANDIDATES:
+            cand = root / sub
+            if (cand / CONFIG_FILE).exists():
+                return cand
+        raise ConfigError(f"{root} has no {CONFIG_FILE}. Run `contour init` there first.")
     env = os.environ.get("CONTOUR_ROOT")
     if env:
         return find_root(explicit=Path(env))
@@ -95,8 +100,12 @@ def find_root(start: Path | None = None, explicit: Path | None = None) -> Path:
     for d in (cur, *cur.parents):
         if (d / CONFIG_FILE).exists():
             return d
+        for sub in SUBDIR_CANDIDATES:
+            cand = d / sub
+            if (cand / CONFIG_FILE).exists():
+                return cand
     raise ConfigError(
-        f"No {CONFIG_FILE} found in {cur} or any parent directory. "
+        f"No {CONFIG_FILE} found in {cur} (or its {SUBDIR_CANDIDATES} subdirectories) or any parent directory. "
         "Run `contour init` to create a Contour root, or pass --root."
     )
 

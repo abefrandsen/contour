@@ -105,6 +105,25 @@ class TestCli(unittest.TestCase):
         self.assertEqual(fm["title"], 'Claim with "quotes"')
         self.assertEqual(fm["supports"], [f"[[{child_a_id}]]"])
 
+    def test_init_subdir_with_skill_and_ejected_logger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                main([
+                    "--json",
+                    "init",
+                    str(repo / "contour"),
+                    "--with-skill",
+                    "--eject-logger",
+                    str(repo / "contour_run.py"),
+                ])
+            out = json.loads(buf.getvalue())
+            self.assertTrue((repo / "contour" / "contour.yaml").exists())
+            self.assertTrue((repo / ".agent" / "skills" / "contour-research" / "SKILL.md").exists())
+            self.assertTrue((repo / "contour_run.py").exists())
+            self.assertIn("root", out)
+
 
 if __name__ == "__main__":
     unittest.main()

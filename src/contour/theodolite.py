@@ -23,6 +23,7 @@ from typing import Any
 import uuid
 
 from .bundle import DEFAULT_TIER, SCHEMA_ID, validate_bundle
+from .config import ConfigError, find_root
 
 
 def _normalize_str_list(val: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -148,7 +149,16 @@ class Run:
         self.rank = _detect_rank()
         self.enabled = (self.rank == 0) or (not rank_zero_only)
         self.repo_path = repo_path or os.environ.get("AIM_REPO", ".")
-        self.bundle_dir = Path(bundle_dir) if bundle_dir is not None else None
+        if bundle_dir is None:
+            self.bundle_dir = None
+        elif bundle_dir == "field_bundles":
+            try:
+                croot = find_root(start=Path(git_cwd) if git_cwd else None)
+                self.bundle_dir = croot / "field_bundles"
+            except ConfigError:
+                self.bundle_dir = Path("field_bundles")
+        else:
+            self.bundle_dir = Path(bundle_dir)
         self.start_time = time.monotonic()
         self.created_at = _utc_now_iso()
         self.finished_at: str | None = None
