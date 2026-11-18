@@ -1,4 +1,4 @@
-# Contour — Epistemic ML Research State, Verification & Ideation
+# Contour — Survey, Map & Explore Your ML Research Landscape
 
 ![Contour Banner](assets/pixel_art/banner_pixel_1920x1080_diffuse.png)
 
