@@ -1,6 +1,6 @@
 # Contour — Epistemic ML Research State, Verification & Ideation
 
-![Contour Banner](assets/banner.jpg)
+![Contour Banner](assets/pixel_art/banner_pixel_1920x1080_diffuse.png)
 
 **Contour** maintains a clean, low-friction empirical ML research state in plain Markdown and Git across three node types: **Goals** (`goals/goal_*.md`), **Claims** (`claims/clm_*.md`), and **Runs** (`runs/run_*.md`).
 
