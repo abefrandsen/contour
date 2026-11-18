@@ -38,6 +38,11 @@ def as_wikilink(node_id: str) -> str:
     return f"[[{strip_wiki(node_id)}]]"
 
 
+def extract_wikilinks(text: str) -> set[str]:
+    """Return all node IDs referenced via [[id]] inside Markdown body text."""
+    return {strip_wiki(m.group(0)) for m in WIKI_RE.finditer(text or "")}
+
+
 def parse_markdown(text: str) -> tuple[dict[str, Any], str]:
     """Split a Markdown document into (frontmatter, body). Tolerates CRLF and empty frontmatter."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")

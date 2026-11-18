@@ -1,12 +1,13 @@
 {
   "name": "contour-research",
   "displayName": "Contour ML Research",
-  "version": "0.2.0",
-  "description": "Lightweight epistemic ML research framework: ingest training runs, auto-compute controlled parent diffs, and generate next experiment candidates across any repository.",
+  "version": "1.0.0",
+  "description": "Lightweight epistemic ML research framework: log runs directly to Markdown, verify claims mechanically and agentically, and ideate next experiments.",
   "logo": "assets/icon.jpg",
   "suggestedPrompts": [
-    "Initialize Contour in this repo and set up our first expedition and cairn",
-    "Sync the latest training runs and check for confounded comparisons",
-    "Run contour bearings and propose the highest-leverage next experiments"
+    "Initialize Contour in this repo and set up our first goal and claim",
+    "Synthesize the latest runs into our claims and run contour check",
+    "Audit our active claims and surface anything needing human review",
+    "Run contour ideate and propose the highest-leverage next experiments"
   ]
 }

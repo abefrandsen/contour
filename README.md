@@ -1,174 +1,137 @@
-# Contour — Survey and Map Your ML Research Landscape
+# Contour — Epistemic ML Research State, Verification & Ideation
 
 ![Contour Banner](assets/banner.jpg)
 
-**Contour** maintains an easily navigable research state built on top of many training runs, designed for both human researchers and AI agents using plain Markdown and Git.
+**Contour** maintains a clean, low-friction empirical ML research state in plain Markdown and Git across three node types: **Goals** (`goals/goal_*.md`), **Claims** (`claims/clm_*.md`), and **Runs** (`runs/run_*.md`).
 
-Install Contour once and use it as a plug-in research layer across any number of independent ML repositories:
-
-1. **Empirical Ground Truth (`fieldlogs/log_*.md` & `bundles/*.json`):** Any training platform (or `from contour import Run`) emits a portable `contour.field_bundle/v1` JSON bundle. `contour sync` validates it, archives the bundle, distills a Markdown card in `fieldlogs/`, and **automatically computes `vs_parent`** (metric deltas, `single_logical_diff` confound check, and optional `noise.yaml` noise-floor SNR).
-2. **Research Claims & Campaigns (`cairns/crn_*.md` & `expeditions/expd_*.md`):** Plain Markdown files tracking overarching research campaigns (`expeditions/`) and falsifiable claims (`cairns/`) linked directly to fieldlogs via `supports`, `contradicts`, and `qualifies`.
-3. **Navigation & Experiment Generation (`contour` CLI):** Instant graph retrieval, on-the-fly multi-run comparisons (`contour compare`), Pareto frontiers (`contour ridge`), and **6 Scientific Move detectors (`contour bearings`)** that mine your runs to propose the highest-leverage next experiments.
+1. **Research State Integrity (Verification & Hygiene):**
+   - **Single-File Runs (`runs/run_*.md`):** `from contour import Run` writes machine-owned `config`, `compute`, `code`, `metrics`, and hash-checked `vs_parent` directly to Markdown while preserving human/agent notes.
+   - **Three-Tier Verification Funnel:**
+     1. **Mechanical (`contour check`):** Deterministic rules (`C001`–`C009`) enforcing metric conventions, config/facet diff accountability, staleness (`inputs_hash` & `verified_hash`), and claim rigor.
+     2. **Agentic (*Critic* workflow + `contour verify --agent`):** Adversarial AI audit checking for hidden confounds, scope over-generalization, and alternative explanations.
+     3. **Selective Human (`contour review` + `contour verify --human`):** High-signal inbox surfacing only claims awaiting sign-off, stale verified claims, and dirty-code frontier runs.
+2. **State-Conditioned Idea Generation (`contour ideate`):**
+   - Progressive introspection (`status`, `runs --tree`, `compare`, `frontier`, `show`) plus 6 deterministic Scientific Moves that surface confounds to isolate, tensions to probe, verified or compounding marginal wins to combine, multi-tag ablations, untested regimes, and frontier bottlenecks.
 
 ---
 
-## Installation (Use Across Any Research Repo)
-
-Install Contour in editable mode (or link `contour` onto `$PATH` and Python's user site-packages):
+## Installation
 
 ```bash
 pip install -e /path/to/contour
 ```
 
-Then, inside **any ML project repository**:
+Inside **any ML project repository**:
 
 ```bash
 cd ~/projects/my-ml-repo
 
-# Creates a self-contained ./contour/ directory (contour.yaml, expeditions/, cairns/, fieldlogs/, bundles/)
+# Creates ./contour/ (contour.yaml, goals/, claims/, runs/)
 contour init
 
-# Optional flags:
-#   contour init .                  # Initialize at the repo root instead of ./contour/
-#   contour init --with-skill       # Also write .agent/skills/contour-research/SKILL.md into the repo
-#   contour init --eject-logger     # Write a standalone stdlib-only contour_run.py for remote cluster jobs
+# Optional:
+#   contour init .              # Initialize at repo root instead of ./contour/
+#   contour init --with-skill   # Install .agent/skills/contour-research/SKILL.md
 ```
 
-Because `contour` automatically discovers `contour.yaml` in the current directory, any parent directory, or a `contour/` (`.contour/`, `research/`) subdirectory, you can run `contour` commands and `from contour import Run` from anywhere inside `~/projects/my-ml-repo/`.
+Because `contour` automatically discovers `contour.yaml` in the current directory, any ancestor, or a `contour/` (`.contour/`, `research/`) subdirectory, you can run `contour` commands and `from contour import Run` from anywhere inside your repo.
 
 ---
 
-## Quickstart Tutorial: A Day-to-Day Research Loop
+## Quickstart: Day-to-Day Research Loop
 
-### 1. Initialize & Frame the Research Question
-Start by initializing Contour in your project repo, then create an **Expedition** (your overarching goal) and a **Cairn** (a falsifiable hypothesis you want to test):
-
+### 1. Frame a Goal and a Falsifiable Claim
 ```bash
-contour init
-contour new expedition token_mixing \
-  --title "Sub-quadratic & Low-Rank Token Mixing"
-contour new cairn qk_norm_warmup \
-  --title "QK-RMSNorm allows 2x higher peak learning rate and 50% shorter warmup in ViT"
+contour init --with-skill
+contour new goal token_mixing --title "Sub-quadratic & Low-Rank Token Mixing"
+contour new claim qk_norm_warmup --title "QK-RMSNorm allows 2x peak LR and 50% shorter warmup in ViT"
 ```
 
-Open `contour/cairns/crn_qk_norm_warmup.md` in any editor to jot down your intuition and link it to `[[expd_token_mixing]]`.
+### 2. Log Single-Seed Training Runs Directly to `runs/`
+Configure your metric vocabulary and single-seed `min_delta` thresholds in `contour.yaml`:
 
-### 2. Run Experiments & Sync Ground Truth
-Wrap your training script with `contour.Run` (or emit a [Field Bundle JSON](docs/field_bundle.md) from any job runner):
+```yaml
+contour: 1
+iso_tolerance: {params: 0.02, gpu_hours: 0.10}
+ignored_config_keys: [seed, num_workers, log_interval, eval_interval, checkpoint_dir]
+metrics:
+  imagenet1k_val/top1: {direction: max, kind: quality, primary: true, min_delta: 0.20}
+  val/loss:            {direction: min, kind: quality, min_delta: 0.005}
+  sys/throughput_imgs_sec: {direction: max, kind: cost, min_delta: 50.0}
+```
+
+Wrap your training script with `contour.Run`:
 
 ```python
 from contour import Run
 
-# 1. Baseline run
 with Run(
-    exp_name="vit_s_baseline",
+    title="ViT-S/16 Full-Rank Baseline",
     task="image_classification",
-    dataset_train=["imagenet1k_train"],
-    dataset_eval=["imagenet1k_val"],
     arch_family="vit",
     arch_scale="22M",
-    motivated_by=["expd_token_mixing"],
+    dataset_train=["imagenet1k_train_v1"],
+    config={"lr": 0.001, "warmup_epochs": 10, "qk_norm": False},
+    motivated_by=["goal_token_mixing"],
 ) as base_run:
     base_run.track(79.7, name="top1", context={"subset": "imagenet1k_val"})
 
-# 2. Treatment run branching from the baseline
 with Run(
-    exp_name="vit_s_qknorm_2xlr",
+    title="ViT-S/16 QK-RMSNorm + 2x LR",
     task="image_classification",
-    dataset_train=["imagenet1k_train"],
-    dataset_eval=["imagenet1k_val"],
     arch_family="vit",
     arch_scale="22M",
-    interventions=["qk_rmsnorm", "lr_peak=2x", "warmup=0.5x"],
-    parent_runs=[base_run.run_id],
-    motivated_by=["crn_qk_norm_warmup"],
+    dataset_train=["imagenet1k_train_v1"],
+    interventions=["lr=0.002", "warmup_epochs=5", "qk_norm=true", "qk_rmsnorm"],
+    parent_runs=[base_run.id],
+    motivated_by=["clm_qk_norm_warmup"],
+    config={"lr": 0.002, "warmup_epochs": 5, "qk_norm": True},
 ) as treat_run:
     treat_run.track(80.3, name="top1", context={"subset": "imagenet1k_val"})
 ```
 
-Ingest finished runs into `fieldlogs/*.md`:
+On exit, `Run` writes `runs/run_*.md` and computes `vs_parent` (`control_level`, `verdict`, `config_diff`, `unaccounted`, `unrealized`, and per-metric `signal`).
 
+### 3. Synthesize, Check & Verify
 ```bash
-contour sync
+contour runs --tree
+contour link <run_id> clm_qk_norm_warmup
+contour check --fix --strict
+contour verify clm_qk_norm_warmup --agent --note "Clean single-diff control; scoped to ViT-22M classification."
+contour review
 ```
 
-`sync` validates and archives the raw JSON under `bundles/`, creates the Markdown cards in `fieldlogs/`, flags `crn_qk_norm_warmup` with `needs_synthesis: true`, and **automatically computes `vs_parent`** on the treatment run.
-
-### 3. Inspect Diffs, Check Confounds & Synthesize
-Check what needs attention and inspect the new run:
-
+### 4. Generate Next Experiments
 ```bash
-contour drift
-contour inspect <treatment_log_id>
+contour frontier --task image_classification
+contour ideate --goal goal_token_mixing
 ```
-
-The `inspect` view shows the auto-computed `vs_parent` block—confirming whether only the declared `interventions` changed (`single_logical_diff: true`) or whether a confounding facet (like `dataset_train` or `arch_scale`) also shifted. You can also compare arbitrary sets of runs (including multi-seed arms) on the fly:
-
-```bash
-contour compare <control_log_id> --vs <treatment_log_id>
-```
-
-Once you've reviewed the result, link the run to the Cairn and update the Cairn's notes on where the claim holds vs. breaks:
-
-```bash
-contour link <treatment_log_id> crn_qk_norm_warmup --relation supports
-```
-
-*(Optional)* If you have 2+ baseline seed repeats, register the regime's seed-to-seed noise floor once so single-seed deltas are automatically scored by signal-to-noise ratio (`SNR >= 2` $\to$ `Grade A`):
-
-```bash
-contour noise seed image_classification/imagenet1k_val/22M --from <seed0_id> <seed1_id> <seed2_id>
-```
-
-### 4. Generate the Next Wave of Experiments
-As runs accumulate, use `ridge` and `bearings` (or hand the repo to an AI agent with `--json`) to decide what to run next:
-
-```bash
-# View the quality vs. compute Pareto frontier
-contour ridge --eval imagenet1k_val
-
-# Run the 6 Scientific Move detectors to propose next experiments
-contour bearings
-```
-
-`contour bearings` automatically scans your graph for:
-- **Move 1 (Confound Isolation):** Multi-diff runs that need a clean single-diff control run.
-- **Move 2 (Dialectics):** Cairns with contradictions or boundary qualifications (`qualifies`).
-- **Move 3 (Synthesis):** Sibling Pareto-improving interventions (`c1.interventions | c2.interventions`) that haven't been combined yet.
-- **Move 4 (Occam's Razor):** Bundled multi-tag runs (like `["qk_rmsnorm", "lr_peak=2x", "warmup=0.5x"]`) that need leave-one-out ablations to test which tags are actually necessary.
-- **Move 5 (Deduction):** Untested tasks, eval benchmarks, or model scales for supported cairns.
-- **Move 6 (Abduction):** Bottleneck and anomaly notes from the top Pareto-frontier runs.
 
 ---
 
 ## CLI Reference (`contour`)
 
 ```bash
-contour init [path] [--with-skill] [--eject-logger]       # Initialize Contour (defaults to ./contour/)
-contour sync [--from-json <paths...>] [--force]           # Ingest Field Bundles into fieldlogs/
-contour map                                               # Overview of Expeditions -> Cairns -> FieldLogs
-contour inspect <node_id>                                 # Zoom in on an Expedition, Cairn, or FieldLog
-contour compare <ctrl_ids...> --vs <treat_ids...>         # On-the-fly control vs. treatment comparison
-contour link <log_id> <cairn_id> --relation <rel>         # Link a FieldLog under supports/contradicts/qualifies
-contour ridge [--eval <ds>] [--task <t>] [--metric <m>]   # Plot the quality vs. GPU-hour Pareto frontier
-contour bearings [--expedition <expd_id>]                 # Propose next experiments across the 6 Scientific Moves
-contour drift [--strict]                                  # Check graph hygiene and confounded comparisons
-contour noise list                                        # View registered noise floors (noise.yaml)
-contour noise seed <regime> --from <log_ids...>           # Estimate noise floor from baseline seed repeats
-contour new <expedition|cairn|fieldlog> <slug> --title "..."
+# Setup & nodes
+contour init [path] [--with-skill]
+contour new <goal|claim|run> <slug> --title "..."
+
+# Evidence linking
+contour link <run_id> <claim_id> [--as supports|contradicts|qualifies]
+
+# Principle 1: Verification & Hygiene
+contour check [--strict] [--fix]
+contour verify <claim_id> (--agent | --human) [--note "..."]
+contour review
+
+# Principle 2a: Introspection
+contour status
+contour show <node_id>
+contour runs [--tree] [--goal G] [--claim C] [--task T] [--eval E] [--arch A] [--intervention S] [--control L] [--verdict V]
+contour compare <ctrl_id> --vs <treat_id>
+contour frontier [--task T] [--metric M]
+
+# Principle 2b: Ideation
+contour ideate [--goal G]
 ```
-
-Pass `--json` to any command for structured output when working with AI agents or scripts.
-
----
-
-## Core Concepts
-
-| Concept | Meaning | Lives in |
-|---|---|---|
-| **Expedition** | A research campaign with a goal (*North Star*) and open questions. | `expeditions/expd_*.md` |
-| **Cairn** | A falsifiable claim or hypothesis (`active`, `supported`, `falsified`) linked to `fieldlogs/` via `supports`, `contradicts`, and `qualifies`. | `cairns/crn_*.md` |
-| **FieldLog** | The machine-written record of one run (`status`, `tier: probe\|proxy\|full`, `metrics`, `interventions`, `vs_parent`), paired with human/agent notes in the Markdown body. | `fieldlogs/log_*.md` |
-| **Field Bundle** | The portable JSON contract (`contour.field_bundle/v1`) emitted by `contour.Run` or any training platform. | `bundles/*.json` |
-| **`vs_parent` & Evidence Grade (`A`/`B`/`C`)** | Auto-computed comparison on every child FieldLog (and via `contour compare`). **A** = single logical diff (`single_logical_diff: true`), iso-compute, and clears noise floor (`SNR >= 2`). **B** = controlled single diff without a noise-floor check or within noise. **C** = confounded (multiple facets changed, e.g. dataset + architecture), `probe` tier, or non-usable. | `fieldlogs/log_*.md` frontmatter |
-| **Noise Floor (`noise.yaml`)** | Optional registry storing seed-to-seed standard deviation per `(task/eval/scale)` regime so single-seed runs can be judged against baseline variance (`clears_noise`). | `noise.yaml` |
+*(Pass `--json` to any command for structured output.)*

@@ -1,0 +1,38 @@
+contour: 1
+iso_tolerance:
+  params: 0.02
+  gpu_hours: 0.10
+ignored_config_keys:
+  - seed
+  - num_workers
+  - log_interval
+  - eval_interval
+  - checkpoint_dir
+metrics:
+  imagenet1k_val/top1:
+    direction: max
+    kind: quality
+    primary: true
+    min_delta: 0.20
+  imagenet_v2/top1:
+    direction: max
+    kind: quality
+    min_delta: 0.20
+  ade20k_val/miou:
+    direction: max
+    kind: quality
+    primary: true
+    min_delta: 0.50
+  cifar100_val/top1:
+    direction: max
+    kind: quality
+    primary: true
+    min_delta: 0.30
+  val/loss:
+    direction: min
+    kind: quality
+    min_delta: 0.005
+  sys/throughput_imgs_sec:
+    direction: max
+    kind: cost
+    min_delta: 50.0

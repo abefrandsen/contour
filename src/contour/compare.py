@@ -1,363 +1,406 @@
-"""Controlled comparisons between runs: embedded `vs_parent` diffs and on-the-fly `contour compare`."""
+"""Controlled comparisons between runs: `vs_parent` and `contour compare`."""
 
 from __future__ import annotations
 
+import hashlib
 import json
-import math
-from pathlib import Path
 from typing import Any
 
-from .bundle import TIER_ALIASES
 from .config import ContourConfig
-from .graph import ContourGraph, ContourNode
-from .haze import load_noise, lookup_noise, regime_key, sample_std
+from .graph import FACET_KEYS, ContourGraph, ContourNode
 from .mdio import as_wikilink
 
-TIER_ORDER = {"probe": 0, "proxy": 1, "full": 2}
-SNR_THRESHOLD = 2.0
+DECISIVE_VERDICTS = ("win", "efficiency_win", "tradeoff", "regression")
+
+_VERDICT_TABLE: dict[tuple[str, str], str] = {
+    ("clear", "better"): "win",
+    ("clear", "matched"): "win",
+    ("clear", "worse"): "tradeoff",
+    ("marginal", "better"): "marginal",
+    ("marginal", "matched"): "marginal",
+    ("marginal", "worse"): "tradeoff",
+    ("neutral", "better"): "efficiency_win",
+    ("neutral", "matched"): "neutral",
+    ("neutral", "worse"): "regression",
+    ("regression", "better"): "tradeoff",
+    ("regression", "matched"): "regression",
+    ("regression", "worse"): "regression",
+}
 
 
-def _norm_tier(raw: Any) -> str:
-    s = str(raw or "proxy")
-    return TIER_ALIASES.get(s, s)
+def canonical_hash(payload: Any) -> str:
+    """Return a deterministic 8-hex-char truncated SHA-256 hash."""
+    encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:8]
 
 
-def _lowest_tier(fms: list[dict[str, Any]]) -> str:
-    tiers = [_norm_tier(r.get("tier")) for r in fms]
-    return min(tiers, key=lambda t: TIER_ORDER.get(t, 1))
+def _norm_facet_value(key: str, val: Any) -> Any:
+    if key == "dataset_train":
+        if val is None:
+            return []
+        if isinstance(val, str):
+            return [val]
+        return sorted(str(x) for x in val)
+    return val
 
 
-def _arm_compute_values(fms: list[dict[str, Any]], key: str) -> list[float]:
-    vals: list[float] = []
-    for r in fms:
-        comp = r.get("compute") or {}
-        v = comp.get(key)
-        if isinstance(v, (int, float)):
-            vals.append(float(v))
-    return vals
+def _run_hash_snapshot(fm: dict[str, Any]) -> dict[str, Any]:
+    code = fm.get("code") or {}
+    return {
+        "id": fm.get("id"),
+        "status": fm.get("status"),
+        "validity": fm.get("validity", "ok"),
+        "facets": {k: _norm_facet_value(k, fm.get(k)) for k in FACET_KEYS},
+        "config": fm.get("config") or {},
+        "interventions": [str(x) for x in (fm.get("interventions") or [])],
+        "metrics": fm.get("metrics") or {},
+        "compute": fm.get("compute") or {},
+        "code_commit": code.get("commit"),
+        "code_dirty": bool(code.get("dirty", False)),
+    }
 
 
-def _check_iso_compute(
-    controls: list[dict[str, Any]], treatments: list[dict[str, Any]], tol: float
+def compute_inputs_hash(
+    run_fm: dict[str, Any],
+    base_fm: dict[str, Any],
+    config: ContourConfig,
 ) -> str:
-    """Return 'verified', 'reduced', 'violated', or 'unknown'.
+    """Truncated SHA-256 over every input read by `vs_parent` (§4.1)."""
+    r_metrics = set((run_fm.get("metrics") or {}).keys())
+    b_metrics = set((base_fm.get("metrics") or {}).keys())
+    shared = sorted(r_metrics & b_metrics)
+    metric_specs = {m: config.metric_spec(m) for m in shared}
+    payload = {
+        "baseline_id": base_fm.get("id"),
+        "baseline": _run_hash_snapshot(base_fm),
+        "treatment": _run_hash_snapshot(run_fm),
+        "shared_metric_specs": metric_specs,
+        "ignored_config_keys": sorted(config.ignored_config_keys),
+        "iso_tolerance": config.iso_tolerance,
+    }
+    return canonical_hash(payload)
 
-    Using > (1 + tol) params/FLOPs in treatment is a compute confound ('violated').
-    Using fewer params/FLOPs is a compression/efficiency reduction ('reduced'), not a confound.
-    """
+
+def compute_iso_compute(
+    base_fm: dict[str, Any],
+    treat_fm: dict[str, Any],
+    iso_tolerance: dict[str, float],
+) -> str:
+    """Compare whichever of `params` and `gpu_hours` are shared by both runs (§4.1)."""
+    b_comp = base_fm.get("compute") or {}
+    t_comp = treat_fm.get("compute") or {}
     checked = False
     reduced = False
-    for key in ("params", "flops"):
-        c_vals = _arm_compute_values(controls, key)
-        t_vals = _arm_compute_values(treatments, key)
-        if len(c_vals) == len(controls) and len(t_vals) == len(treatments) and c_vals and t_vals:
+    for key in ("params", "gpu_hours"):
+        bv = b_comp.get(key)
+        tv = t_comp.get(key)
+        if (
+            isinstance(bv, (int, float))
+            and not isinstance(bv, bool)
+            and isinstance(tv, (int, float))
+            and not isinstance(tv, bool)
+        ):
+            bf, tf = float(bv), float(tv)
+            if bf < 0 or tf < 0:
+                continue
             checked = True
-            c_mean = sum(c_vals) / len(c_vals)
-            t_mean = sum(t_vals) / len(t_vals)
-            if c_mean > 0:
-                rel_diff = (t_mean - c_mean) / c_mean
-                if rel_diff > tol:
-                    return "violated"
-                if rel_diff < -tol:
-                    reduced = True
+            if bf == 0:
+                if tf > 0:
+                    return "increased"
+                continue
+            tol = float(iso_tolerance.get(key, 0.02))
+            rel = (tf - bf) / bf
+            if rel > tol:
+                return "increased"
+            if rel < -tol:
+                reduced = True
     if not checked:
         return "unknown"
-    return "reduced" if reduced else "verified"
+    return "reduced" if reduced else "matched"
 
 
-def _load_bundle_configs(root: Path, fms: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    configs: list[dict[str, Any]] = []
-    for r in fms:
-        bpath = r.get("bundle")
-        if not bpath:
-            continue
-        p = root / str(bpath)
-        if p.exists():
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-                if isinstance(data.get("config"), dict):
-                    configs.append(data["config"])
-            except Exception:
-                pass
-    return configs
+def _str_matches(actual: Any, declared: str) -> bool:
+    if actual is None:
+        return declared.lower() in ("none", "null", "")
+    if isinstance(actual, bool):
+        return str(actual).lower() == declared.lower()
+    if isinstance(actual, (list, tuple)):
+        norm = [_norm_str_item(x) for x in actual]
+        decl_parts = [p.strip() for p in declared.strip("[]").split(",") if p.strip()]
+        return norm == decl_parts or str(actual) == declared
+    if isinstance(actual, (int, float)):
+        if str(actual) == declared:
+            return True
+        try:
+            return float(actual) == float(declared)
+        except ValueError:
+            return False
+    return str(actual) == declared
 
 
-def _is_usable_fm(fm: dict[str, Any]) -> bool:
-    return str(fm.get("status", "unknown")) == "final" and str(fm.get("validity", "ok")) == "ok"
+def _norm_str_item(x: Any) -> str:
+    return str(x).strip()
 
 
-def _interventions_set(fm: dict[str, Any]) -> frozenset[str]:
-    return frozenset(str(x) for x in (fm.get("interventions") or []))
+def compute_diff_accountability(
+    base_fm: dict[str, Any],
+    treat_fm: dict[str, Any],
+    ignored_config_keys: set[str],
+) -> dict[str, Any]:
+    """Compute facet_diff, config_diff, unaccounted, and unrealized (§4.2)."""
+    facet_diff: dict[str, dict[str, Any]] = {}
+    for key in FACET_KEYS:
+        bv = _norm_facet_value(key, base_fm.get(key))
+        tv = _norm_facet_value(key, treat_fm.get(key))
+        if bv != tv:
+            facet_diff[key] = {"baseline": bv, "value": tv}
 
+    b_cfg = dict(base_fm.get("config") or {})
+    t_cfg = dict(treat_fm.get("config") or {})
+    all_cfg_keys = sorted((set(b_cfg) | set(t_cfg)) - ignored_config_keys)
+    config_diff: dict[str, dict[str, Any]] = {}
+    for k in all_cfg_keys:
+        bv = b_cfg.get(k)
+        tv = t_cfg.get(k)
+        if bv != tv:
+            config_diff[k] = {"baseline": bv, "value": tv}
 
-def _evals_list(fm: dict[str, Any]) -> list[str]:
-    return [str(x) for x in (fm.get("dataset_eval") or [])]
+    b_intervs = [str(x) for x in (base_fm.get("interventions") or [])]
+    t_intervs = [str(x) for x in (treat_fm.get("interventions") or [])]
 
+    declared_kv: dict[str, list[str]] = {}
+    free_text: list[str] = []
+    for entry in t_intervs:
+        if "=" in entry:
+            k, v = entry.split("=", 1)
+            declared_kv.setdefault(k.strip(), []).append(v.strip())
+        else:
+            free_text.append(entry)
 
-def compute_facet_diff_from_fms(
-    root: Path,
-    controls: list[dict[str, Any]],
-    treatments: list[dict[str, Any]],
-    iso_tol: float = 0.02,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Compute facet differences and confound flags between control and treatment frontmatters."""
-    all_runs = controls + treatments
-    confounding_facets: dict[str, list[Any]] = {}
+    unaccounted: list[str] = []
+    for key in sorted(set(facet_diff) | set(config_diff)):
+        if key not in declared_kv:
+            unaccounted.append(key)
 
-    for key in ("task", "arch_family", "arch_scale"):
-        vals = sorted({str(r.get(key) or "") for r in all_runs})
-        if len(vals) > 1:
-            confounding_facets[key] = vals
+    unrealized: list[str] = []
+    for key, vals in sorted(declared_kv.items()):
+        actual = treat_fm.get(key) if key in FACET_KEYS else t_cfg.get(key)
+        if not any(_str_matches(actual, v) for v in vals):
+            unrealized.append(f"{key}={vals[-1]}")
 
-    tier_vals = sorted({_norm_tier(r.get("tier")) for r in all_runs})
-    if len(tier_vals) > 1:
-        confounding_facets["tier"] = tier_vals
-
-    train_sets = sorted({tuple(sorted(str(x) for x in (r.get("dataset_train") or []))) for r in all_runs})
-    if len(train_sets) > 1:
-        confounding_facets["dataset_train"] = [list(ts) for ts in train_sets]
-
-    c_intervs = {_interventions_set(r) for r in controls}
-    t_intervs = {_interventions_set(r) for r in treatments}
-    arm_inconsistent = len(c_intervs) > 1 or len(t_intervs) > 1
-
-    c_union: set[str] = set().union(*c_intervs) if c_intervs else set()
-    t_union: set[str] = set().union(*t_intervs) if t_intervs else set()
-    added = sorted(t_union - c_union)
-    removed = sorted(c_union - t_union)
-
-    c_evals = set().union(*(set(_evals_list(r)) for r in controls)) if controls else set()
-    t_evals = set().union(*(set(_evals_list(r)) for r in treatments)) if treatments else set()
-    shared_evals = sorted(c_evals & t_evals)
-
-    c_cfgs = _load_bundle_configs(root, controls)
-    t_cfgs = _load_bundle_configs(root, treatments)
-    cfg_diff: dict[str, Any] = {}
-    if len(c_cfgs) == len(controls) and len(t_cfgs) == len(treatments) and c_cfgs and t_cfgs:
-        all_keys = sorted({k for d in (c_cfgs + t_cfgs) for k in d})
-        for k in all_keys:
-            cv = [d.get(k) for d in c_cfgs]
-            tv = [d.get(k) for d in t_cfgs]
-            if cv != tv:
-                cfg_diff[k] = {
-                    "control": cv[0] if len(set(map(str, cv))) == 1 else cv,
-                    "treatment": tv[0] if len(set(map(str, tv))) == 1 else tv,
-                }
-
-    iso_compute = _check_iso_compute(controls, treatments, tol=iso_tol)
-    all_usable = all(_is_usable_fm(r) for r in all_runs)
-    has_intervention_diff = bool(added or removed)
-    single_logical_diff = (
-        len(confounding_facets) == 0
-        and not arm_inconsistent
-        and has_intervention_diff
+    b_code = base_fm.get("code") or {}
+    t_code = treat_fm.get("code") or {}
+    b_commit = b_code.get("commit")
+    t_commit = t_code.get("commit")
+    t_dirty = bool(t_code.get("dirty", False))
+    same_clean_commit = (
+        b_commit is not None
+        and t_commit is not None
+        and b_commit == t_commit
+        and not t_dirty
     )
+    b_interv_set = set(b_intervs)
+    for entry in free_text:
+        if entry not in b_interv_set and same_clean_commit:
+            unrealized.append(entry)
 
-    facet_diff = {
-        "confounding_facets": confounding_facets,
-        "added_interventions": added,
-        "removed_interventions": removed,
-        "arm_inconsistent": arm_inconsistent,
-        "shared_evals": shared_evals,
-        "config_diff": cfg_diff,
+    return {
+        "facet_diff": facet_diff,
+        "config_diff": config_diff,
+        "unaccounted": sorted(unaccounted),
+        "unrealized": unrealized,
     }
-    confounds = {
-        "single_logical_diff": single_logical_diff,
-        "iso_compute": iso_compute,
-        "tier": _lowest_tier(all_runs),
-        "all_usable": all_usable,
-        "n_control": len(controls),
-        "n_treatment": len(treatments),
-    }
-    return facet_diff, confounds
 
 
-def _series_map_fm(fm: dict[str, Any], is_telemetry: bool) -> dict[str, float]:
-    raw = fm.get("telemetry" if is_telemetry else "metrics") or {}
-    return {str(k): float(v) for k, v in raw.items() if isinstance(v, (int, float))}
-
-
-def compute_metric_deltas_from_fms(
-    controls: list[dict[str, Any]],
-    treatments: list[dict[str, Any]],
-    noise: dict[str, dict[str, dict[str, Any]]],
-    regime: str | None,
-    is_telemetry: bool = False,
-) -> dict[str, dict[str, Any]]:
-    c_keys = {k for r in controls for k in _series_map_fm(r, is_telemetry)}
-    t_keys = {k for r in treatments for k in _series_map_fm(r, is_telemetry)}
-    shared = sorted(c_keys & t_keys)
-
-    out: dict[str, dict[str, Any]] = {}
-    for k in shared:
-        c_vals = [_series_map_fm(r, is_telemetry)[k] for r in controls if k in _series_map_fm(r, is_telemetry)]
-        t_vals = [_series_map_fm(r, is_telemetry)[k] for r in treatments if k in _series_map_fm(r, is_telemetry)]
-        if not c_vals or not t_vals:
-            continue
-        c_mean = sum(c_vals) / len(c_vals)
-        t_mean = sum(t_vals) / len(t_vals)
-        delta = t_mean - c_mean
-        rel_pct = (delta / abs(c_mean) * 100.0) if c_mean != 0 else None
-
-        se_diff: float | None = None
-        ci_95: list[float] | None = None
-        if len(c_vals) >= 2 and len(t_vals) >= 2:
-            sc = sample_std(c_vals)
-            st = sample_std(t_vals)
-            se_diff = math.sqrt((sc ** 2) / len(c_vals) + (st ** 2) / len(t_vals))
-            margin = 1.96 * se_diff
-            ci_95 = [round(delta - margin, 6), round(delta + margin, 6)]
-
-        noise_entry = lookup_noise(noise, regime, k) if regime else None
-        noise_std = float(noise_entry["std"]) if noise_entry and "std" in noise_entry else None
-
-        noise_scale = se_diff if (se_diff is not None and se_diff > 0) else (
-            noise_std if (noise_std is not None and noise_std > 0) else None
-        )
-        snr = round(abs(delta) / noise_scale, 3) if noise_scale else None
-        clears_noise = (snr >= SNR_THRESHOLD) if snr is not None else None
-
-        out[k] = {
-            "control_mean": round(c_mean, 6),
-            "treatment_mean": round(t_mean, 6),
-            "delta": round(delta, 6),
-            "rel_delta_pct": round(rel_pct, 3) if rel_pct is not None else None,
-            "n_control": len(c_vals),
-            "n_treatment": len(t_vals),
-            "se_diff": round(se_diff, 6) if se_diff is not None else None,
-            "ci_95": ci_95,
-            "noise_std": noise_std,
-            "snr": snr,
-            "clears_noise": clears_noise,
-        }
-    return out
-
-
-def compute_grade(
-    confounds: dict[str, Any],
-    metric_deltas: dict[str, dict[str, Any]],
-    config: ContourConfig | None = None,
+def compute_control_level(
+    base_fm: dict[str, Any],
+    treat_fm: dict[str, Any],
+    diff_info: dict[str, Any],
 ) -> str:
-    """Assign ordinal evidence quality badge A / B / C."""
-    if (
-        not confounds["all_usable"]
-        or not confounds["single_logical_diff"]
-        or _norm_tier(confounds["tier"]) == "probe"
-        or confounds["iso_compute"] == "violated"
-    ):
-        return "C"
-
-    quality_deltas = [
-        d for k, d in metric_deltas.items()
-        if not (config.is_cost_metric(k) if config else (k.lower().startswith("sys/") or "throughput" in k.lower()))
-    ]
-    if any(d.get("clears_noise") is True for d in quality_deltas):
-        return "A"
-    if confounds["iso_compute"] == "reduced" and any(d.get("clears_noise") is True for d in metric_deltas.values()):
-        return "A"
-    return "B"
+    """Assign `invalid | confounded | exploratory | clean` (§4.2)."""
+    if str(base_fm.get("validity", "ok")) != "ok" or str(treat_fm.get("validity", "ok")) != "ok":
+        return "invalid"
+    if diff_info["unaccounted"] or diff_info["unrealized"]:
+        return "confounded"
+    b_dirty = bool((base_fm.get("code") or {}).get("dirty", False))
+    t_dirty = bool((treat_fm.get("code") or {}).get("dirty", False))
+    is_probe = base_fm.get("tier") == "probe" or treat_fm.get("tier") == "probe"
+    t_intervs = list(treat_fm.get("interventions") or [])
+    is_replicate = not t_intervs and not diff_info["config_diff"]
+    if is_probe or b_dirty or t_dirty or is_replicate:
+        return "exploratory"
+    return "clean"
 
 
-def _resolve_regime(
-    facet_diff: dict[str, Any], first_treatment: dict[str, Any]
-) -> str | None:
-    shared_evals = facet_diff["shared_evals"]
-    if (
-        shared_evals
-        and not facet_diff["confounding_facets"].get("task")
-        and not facet_diff["confounding_facets"].get("arch_scale")
-    ):
-        return regime_key(
-            str(first_treatment.get("task") or "unspecified"),
-            shared_evals[0],
-            str(first_treatment.get("arch_scale") or "unspecified"),
-        )
-    return None
+def _metric_signal(delta: float, direction: str, min_delta: float | None) -> str | None:
+    if min_delta is None:
+        return None
+    beneficial = delta if direction == "max" else -delta
+    if beneficial >= min_delta:
+        return "clear"
+    if beneficial > 0:
+        return "marginal"
+    if beneficial > -min_delta:
+        return "neutral"
+    return "regression"
+
+
+def compute_signals_and_verdict(
+    base_fm: dict[str, Any],
+    treat_fm: dict[str, Any],
+    iso_compute: str,
+    config: ContourConfig,
+) -> tuple[dict[str, dict[str, Any]], str]:
+    """Compute per-metric deltas/signals and the overall run verdict (§4.3)."""
+    b_metrics = {
+        str(k): float(v)
+        for k, v in (base_fm.get("metrics") or {}).items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+    t_metrics = {
+        str(k): float(v)
+        for k, v in (treat_fm.get("metrics") or {}).items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+    shared = sorted(set(b_metrics) & set(t_metrics))
+
+    deltas: dict[str, dict[str, Any]] = {}
+    primary_signals: list[str] = []
+    non_primary_quality_signals: list[str] = []
+    cost_signals: list[str] = []
+
+    for k in shared:
+        bv = b_metrics[k]
+        tv = t_metrics[k]
+        delta = round(tv - bv, 6)
+        kind = config.metric_kind(k)
+        direction = config.metric_direction(k)
+        tau = config.min_delta(k)
+
+        entry: dict[str, Any] = {
+            "baseline": bv,
+            "value": tv,
+            "delta": delta,
+        }
+        if kind in ("quality", "cost"):
+            sig = _metric_signal(tv - bv, direction, tau)
+            if sig is not None:
+                entry["signal"] = sig
+            if kind == "quality":
+                if config.is_primary_metric(k):
+                    if sig is not None:
+                        primary_signals.append(sig)
+                elif sig is not None:
+                    non_primary_quality_signals.append(sig)
+            elif kind == "cost" and sig is not None:
+                cost_signals.append(sig)
+
+        deltas[k] = entry
+
+    if not primary_signals:
+        return deltas, "incomparable"
+
+    # Quality outcome Q
+    if "regression" in primary_signals:
+        q_out = "regression"
+    elif "clear" in primary_signals:
+        q_out = "clear"
+    elif "marginal" in primary_signals:
+        q_out = "marginal"
+    else:
+        q_out = "neutral"
+
+    # Cost outcome C
+    if "regression" in cost_signals or iso_compute == "increased":
+        c_out = "worse"
+    elif "clear" in cost_signals or iso_compute == "reduced":
+        c_out = "better"
+    else:
+        c_out = "matched"
+
+    verdict = _VERDICT_TABLE[(q_out, c_out)]
+
+    # Non-primary quality metric regression downgrade
+    if "regression" in non_primary_quality_signals:
+        if verdict in ("win", "marginal", "efficiency_win"):
+            verdict = "tradeoff"
+        elif verdict == "neutral":
+            verdict = "regression"
+
+    return deltas, verdict
+
+
+def recommend_relation(control_level: str, verdict: str) -> str:
+    """Advisory link relation (§4.3)."""
+    if control_level == "clean" and verdict in ("win", "efficiency_win"):
+        return "supports"
+    if control_level == "clean" and verdict == "regression":
+        return "contradicts"
+    return "qualifies"
 
 
 def compute_vs_parent(
-    root: Path,
-    child_fm: dict[str, Any],
-    parent_fm: dict[str, Any],
-    haze: dict[str, dict[str, dict[str, Any]]] | None = None,
-    config: ContourConfig | None = None,
-    iso_tol: float = 0.02,
-) -> dict[str, Any]:
-    """Compute the embedded `vs_parent` summary stored on a child FieldLog."""
-    noise_data = haze if haze is not None else load_noise(root)
-    facet_diff, confounds = compute_facet_diff_from_fms(root, [parent_fm], [child_fm], iso_tol=iso_tol)
-    regime = _resolve_regime(facet_diff, child_fm)
-    metric_deltas = compute_metric_deltas_from_fms([parent_fm], [child_fm], noise_data, regime, is_telemetry=False)
-    grade = compute_grade(confounds, metric_deltas, config=config)
-
-    compact_deltas: dict[str, dict[str, Any]] = {}
-    for k, d in metric_deltas.items():
-        entry: dict[str, Any] = {
-            "parent": d["control_mean"],
-            "value": d["treatment_mean"],
-            "delta": d["delta"],
-        }
-        if d.get("rel_delta_pct") is not None:
-            entry["rel_delta_pct"] = d["rel_delta_pct"]
-        if d.get("noise_std") is not None:
-            entry["noise_std"] = d["noise_std"]
-            entry["snr"] = d["snr"]
-            entry["clears_noise"] = d["clears_noise"]
-        compact_deltas[k] = entry
-
-    out: dict[str, Any] = {
-        "parent": as_wikilink(str(parent_fm["id"])),
-        "grade": grade,
-        "single_logical_diff": confounds["single_logical_diff"],
-        "iso_compute": confounds["iso_compute"],
-        "confounding_facets": facet_diff["confounding_facets"],
-        "added_interventions": facet_diff["added_interventions"],
-        "removed_interventions": facet_diff["removed_interventions"],
-        "config_diff": facet_diff["config_diff"],
-        "regime": regime,
-        "deltas": compact_deltas,
-    }
-    return out
-
-
-def compare_runs(
-    g: ContourGraph,
-    control_ids: list[str],
-    treatment_ids: list[str],
-    iso_tol: float = 0.02,
-) -> dict[str, Any]:
-    """Compute an on-the-fly comparison between control and treatment FieldLogs."""
-    controls: list[ContourNode] = []
-    for cid in control_ids:
-        node = g.fieldlogs.get(cid)
-        if not node:
-            raise ValueError(f"Unknown control fieldlog: {cid!r}")
-        controls.append(node)
-    treatments: list[ContourNode] = []
-    for tid in treatment_ids:
-        node = g.fieldlogs.get(tid)
-        if not node:
-            raise ValueError(f"Unknown treatment fieldlog: {tid!r}")
-        treatments.append(node)
-
-    c_fms = [c.frontmatter for c in controls]
-    t_fms = [t.frontmatter for t in treatments]
-
-    facet_diff, confounds = compute_facet_diff_from_fms(g.root, c_fms, t_fms, iso_tol=iso_tol)
-    regime = _resolve_regime(facet_diff, t_fms[0])
-    noise = load_noise(g.root)
-    metric_deltas = compute_metric_deltas_from_fms(c_fms, t_fms, noise, regime, is_telemetry=False)
-    telemetry_deltas = compute_metric_deltas_from_fms(c_fms, t_fms, noise, regime, is_telemetry=True)
-    grade = compute_grade(confounds, metric_deltas, config=g.config)
-
+    run_fm: dict[str, Any],
+    base_fm: dict[str, Any],
+    config: ContourConfig,
+) -> dict[str, Any] | None:
+    """Compute fresh `vs_parent` dict for a run against its effective baseline (§4.1)."""
+    if run_fm.get("status") != "final" or base_fm.get("status") != "final":
+        return None
+    iso_compute = compute_iso_compute(base_fm, run_fm, config.iso_tolerance)
+    diff_info = compute_diff_accountability(base_fm, run_fm, config.ignored_config_keys)
+    control_level = compute_control_level(base_fm, run_fm, diff_info)
+    deltas, verdict = compute_signals_and_verdict(base_fm, run_fm, iso_compute, config)
+    inputs_hash = compute_inputs_hash(run_fm, base_fm, config)
     return {
-        "controls": [c.id for c in controls],
-        "treatments": [t.id for t in treatments],
-        "grade": grade,
-        "tier": confounds["tier"],
-        "regime": regime,
-        "confounds": confounds,
-        "facet_diff": facet_diff,
-        "metrics": metric_deltas,
-        "telemetry": telemetry_deltas,
+        "baseline": as_wikilink(str(base_fm["id"])),
+        "inputs_hash": inputs_hash,
+        "control_level": control_level,
+        "verdict": verdict,
+        "iso_compute": iso_compute,
+        "facet_diff": diff_info["facet_diff"],
+        "config_diff": diff_info["config_diff"],
+        "unaccounted": diff_info["unaccounted"],
+        "unrealized": diff_info["unrealized"],
+        "deltas": deltas,
+    }
+
+
+def get_fresh_vs_parent(g: ContourGraph, run: ContourNode) -> dict[str, Any] | None:
+    """Always recompute `vs_parent` in memory from current node states (§4.1)."""
+    base_id = run.effective_baseline
+    if not base_id or base_id not in g.runs:
+        return None
+    return compute_vs_parent(run.frontmatter, g.runs[base_id].frontmatter, g.config)
+
+
+def compare_runs(g: ContourGraph, ctrl_id: str, treat_id: str) -> dict[str, Any]:
+    """Ad-hoc §4 comparison between any two runs. Writes nothing."""
+    ctrl = g.runs.get(ctrl_id)
+    if not ctrl:
+        raise ValueError(f"Unknown control run: {ctrl_id!r}")
+    treat = g.runs.get(treat_id)
+    if not treat:
+        raise ValueError(f"Unknown treatment run: {treat_id!r}")
+
+    iso_compute = compute_iso_compute(ctrl.frontmatter, treat.frontmatter, g.config.iso_tolerance)
+    diff_info = compute_diff_accountability(
+        ctrl.frontmatter, treat.frontmatter, g.config.ignored_config_keys
+    )
+    control_level = compute_control_level(ctrl.frontmatter, treat.frontmatter, diff_info)
+    deltas, verdict = compute_signals_and_verdict(
+        ctrl.frontmatter, treat.frontmatter, iso_compute, g.config
+    )
+    return {
+        "control": ctrl.id,
+        "treatment": treat.id,
+        "control_level": control_level,
+        "verdict": verdict,
+        "recommended_link": recommend_relation(control_level, verdict),
+        "iso_compute": iso_compute,
+        "facet_diff": diff_info["facet_diff"],
+        "config_diff": diff_info["config_diff"],
+        "unaccounted": diff_info["unaccounted"],
+        "unrealized": diff_info["unrealized"],
+        "deltas": deltas,
     }

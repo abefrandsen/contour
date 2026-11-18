@@ -1,26 +1,41 @@
-"""Contour: Topographical & Epistemic ML Research Framework."""
+"""Contour: Epistemic ML research state, verification, and ideation."""
 
-from .bundle import SCHEMA_ID, BundleError, validate_bundle
-from .config import ContourConfig, find_root, load_config
-from .drift import find_drift_issues
+from .check import (
+    Issue,
+    compute_frontier,
+    compute_verified_hash,
+    effective_verification,
+    find_check_issues,
+    find_review_items,
+    fix_stale_vs_parent,
+)
+from .compare import compare_runs, compute_vs_parent, get_fresh_vs_parent
+from .config import ConfigError, ContourConfig, find_root, load_config
 from .graph import ContourGraph, ContourNode
-from .ingest import ingest_bundle
-from .theodolite import Run, Theodolite, init_run
+from .ideate import generate_ideation
+from .run_logger import Run, ingest_record, init_run
 
-__version__ = "0.2.0"
+__version__ = "1.0.0"
 
 __all__ = [
-    "SCHEMA_ID",
-    "BundleError",
+    "ConfigError",
     "ContourConfig",
     "ContourGraph",
     "ContourNode",
+    "Issue",
     "Run",
-    "Theodolite",
-    "find_drift_issues",
+    "compare_runs",
+    "compute_frontier",
+    "compute_verified_hash",
+    "compute_vs_parent",
+    "effective_verification",
+    "find_check_issues",
+    "find_review_items",
     "find_root",
-    " ingest_bundle",
+    "fix_stale_vs_parent",
+    "generate_ideation",
+    "get_fresh_vs_parent",
+    "ingest_record",
     "init_run",
     "load_config",
-    "validate_bundle",
 ]

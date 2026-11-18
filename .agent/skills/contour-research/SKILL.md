@@ -1,55 +1,89 @@
 ---
 name: contour-research
-description: Navigate, survey, and reason over the Contour ML Epistemic Graph (Expeditions, Cairns, and FieldLogs). Use this skill whenever ingesting new ML runs, comparing runs, updating cairns, checking for confounded diffs, or generating next experimental bearings.
+description: Navigate, verify, synthesize, and ideate over the Contour ML research state (Goals, Claims, and Runs). Use whenever logging/inspecting ML runs, auditing claims, checking for confounds, or generating next experiments.
 ---
 
 # Contour: Epistemic ML Research Copilot Skill
 
-**Contour** maintains a clean, low-friction Markdown + Git research state over many ML training runs in any repository:
-1. **Empirical Ground Truth (`fieldlogs/log_*.md`, `bundles/*.json`, optional `noise.yaml`):** Any training platform (or `from contour import Run`) emits a `contour.field_bundle/v1` JSON bundle; `contour sync` validates, archives, and distills it into `fieldlogs/` with an auto-computed `vs_parent` diff (`single_logical_diff`, `confounding_facets`, metric deltas, and `A`/`B`/`C` quality badge).
-2. **Research Claims (`expeditions/expd_*.md`, `cairns/crn_*.md`):** Cairns hold falsifiable hypotheses and link directly to `fieldlogs/` via `supports`, `contradicts`, and `qualifies`.
-3. **Experiment Generation (`contour bearings`):** Mines the run graph to surface confounded runs needing isolation, contradictions, orthogonal Pareto wins to combine, multi-tag runs to ablate, untested regime gaps, and Pareto frontier bottlenecks.
+**Contour** maintains an empirical ML research state in plain Markdown + Git across three node types:
+- **Goals (`goals/goal_*.md`):** Top-level research objectives and target regimes.
+- **Claims (`claims/clm_*.md`):** Falsifiable hypotheses/findings with separate belief (`status`) and rigor (`verification`) states, linked to runs via `supports`, `contradicts`, and `qualifies`.
+- **Runs (`runs/run_*.md`):** Single canonical record per run (`from contour import Run` writes directly here) with machine-owned `config`, `compute`, `code`, `metrics`, and hash-checked `vs_parent`.
 
-> **Root Discovery:** `contour` automatically locates `contour.yaml` whether it sits at the repository root (`<repo>/contour.yaml`) or inside a dedicated subdirectory (`<repo>/contour/contour.yaml`, `<repo>/.contour/contour.yaml`, or `<repo>/research/contour.yaml`). In a new repo, run `contour init` to create `<repo>/contour/`.
+> **Root Discovery:** `contour` locates `contour.yaml` in the current directory, any ancestor, or a `contour/` (`.contour/`, `research/`) subdirectory.
 
 ---
 
 ## Core Rule: Progressive Context Loading
 
-**Never read all `.md` files at once.** Use `contour` (with `--json` when structured output helps) to survey the graph, then `inspect` only the 2–5 relevant nodes:
+**Never glob-read all `.md` files at once.** Survey compactly with `--json` or tables first, then `show` only the 2–5 relevant nodes:
 
 ```bash
-contour map --json
-contour bearings --json
-contour ridge --eval imagenet1k_val --json
-contour drift --json
-contour inspect <node_id>
+contour status --json
+contour runs --tree
+contour check --json
+contour frontier --json
+contour show <node_id>
 ```
 
 ---
 
-## Protocol 1: Ingesting, Comparing, and Synthesizing Runs
+## Workflow 1: Synthesize New Runs into Claims
 
-1. **Sync runs:** `contour sync` (or `contour sync --from-json <bundle_or_dir>`).
-   - Every child run automatically gets a `vs_parent` block comparing it against its first resolved parent run.
-2. **Inspect or compare runs:**
-   - `contour inspect <log_id>` shows the run's metrics and its `vs_parent` diff.
-   - `contour compare <ctrl_ids...> --vs <treat_ids...>` computes an on-the-fly comparison between any control and treatment run(s) (single-seed or multi-seed).
-   - Always check `single_logical_diff` and `confounding_facets` before attributing a metric gain to an intervention.
-   - Optionally seed baseline variance once per regime via `contour noise seed <task/eval/scale> --from <baseline_logs...>` to unlock `SNR` and Grade `A` badges on single-seed runs.
-3. **Link runs & update Cairn prose:**
-   - `contour link <log_id> <cairn_id> --relation <supports|contradicts|qualifies>` places the run on the cairn and clears `needs_synthesis`.
-   - Update the Cairn's Markdown body (`## Where This Holds vs. Breaks`) to reflect what holds, what fails, and what remains untested.
+Run this whenever a training run finishes (`from contour import Run` or `contour new run`):
+
+1. **Inspect the run & fresh diff:**
+   - Run `contour show <run_id>` (or `contour compare <ctrl_id> --vs <treat_id>`).
+   - Check `control_level` (`clean | exploratory | confounded`), `verdict`, `unaccounted`, `unrealized`, and per-metric `signal`.
+   - Write a concrete summary in the run's `## Key Takeaway (TL;DR)` (replacing `- TODO:`).
+2. **Salvage confounds if needed (never discard useful runs silently):**
+   - If a matching-facet baseline already exists, set `baseline: '[[run_...]]'` on the treatment run and run `contour check --fix`.
+   - If a key in `unaccounted` is a benign engineering setting (e.g. `num_workers`), register it under `ignored_config_keys` in `contour.yaml`.
+   - Otherwise, link it under `qualifies` and let `contour ideate` Move 1 propose the bridge control.
+3. **Link & synthesize onto the Claim:**
+   - `contour link <run_id> <claim_id>` (uses the advisory relation; pass `--as supports|contradicts|qualifies` when the claim predicts a cost reduction or failure boundary).
+   - **Required synthesis prose:** Update the Claim's `## Evidence Synthesis` to explicitly cite `[[run_id]]` with its concrete delta and control level, and update `scope` (`holds_in`, `breaks_in`, `untested`).
+4. **Run the mechanical gate:**
+   - Run `contour check --fix` then `contour check --json`.
+   - **Hygiene issues (`C001`–`C006`, `C009`):** Fix immediately in the same turn (missing citations, `- TODO:` placeholders, unlinked motivating runs, undeclared metrics).
+   - **Epistemic issues (`C007` over-claimed status):** Never fabricate evidence. Move non-qualifying runs from `supports` to `qualifies`, calibrate `status` back to `active` if needed, and propose a bridge baseline or Move 1 control.
 
 ---
 
-## Protocol 2: Generating Next Experiments (`contour bearings`)
+## Workflow 2: Adversarial Claim Audit (*The Critic*)
 
-Run `contour bearings` to surface concrete next experiments across the **6 Scientific Moves**:
-- **Move 0 (Drift & Hygiene):** Fix stale cairns (`needs_synthesis: true`), unlinked motivating runs (`H003`), or confounded comparisons (`H012`).
-- **Move 1 (Confound Isolation):** When a run changed multiple facets vs its parent (e.g., intervention + `dataset_train`), run the clean single-diff control experiment first.
-- **Move 2 (Dialectics):** Investigate `contradicts` and `qualifies` boundary regimes on active cairns.
-- **Move 3 (Synthesis):** Combine sibling Pareto-improving interventions (`c1.interventions | c2.interventions`) that branched from the same parent.
-- **Move 4 (Occam's Razor):** Run leave-one-out ablations on multi-tag runs (`len(interventions) > 1`) to strip unnecessary complexity.
-- **Move 5 (Deduction):** Expand verified cairns into untested tasks, evals, or model scales.
-- **Move 6 (Abduction):** Inspect the top Pareto-frontier run on each benchmark (`contour ridge`) and target its primary anomaly/bottleneck.
+Run this after updating a Claim or whenever auditing the research state (`contour verify <claim_id> --agent`).
+
+1. **Pass the mechanical gate first:** Ensure `contour check --json` has zero ERRORs and zero epistemic issues (`C007`) on `<claim_id>` and its `supports` runs.
+2. **Critique the Claim skeptically across 4 dimensions:**
+   - **Config & code integrity:** Do `config_diff` and `interventions` genuinely reflect the claimed mechanism, with no hyperparameter tuning asymmetry or uncommitted `code.dirty` changes?
+   - **Scope calibration:** Do the Claim's `title` and `scope.holds_in` stay strictly within the tested `(task, eval, arch_scale)` without over-generalizing?
+   - **Direction & failure boundaries:** Does each linked run's relation (`supports` / `contradicts` / `qualifies`) match what the Claim actually predicts? Are all secondary metric regressions and failure boundaries reflected in `scope.breaks_in`?
+   - **Alternative explanations:** Could a simpler confound (implicit regularization on small datasets, compute/step difference, data shift) explain the gain?
+3. **Record the audit verdict:**
+   - If flaws are found: revise `title`, `scope`, or `status` honestly first.
+   - Once solid, run:
+     ```bash
+     contour verify <claim_id> --agent --note "<concise audit summary>"
+     ```
+   - This promotes `verification` to `agent_audited` with a `verified_hash` lock, queuing it in `contour review` for selective human sign-off (`--human`).
+
+---
+
+## Workflow 3: State-Conditioned Experiment Ideation
+
+Run this when deciding what experiments to run next:
+
+1. Run `contour ideate --json` and `contour frontier --json` (optionally filtered by `--goal` or `--task`).
+2. Review the 6 deterministic moves:
+   - **Move 1 (Isolate confounds):** Salvage or de-confound positive `confounded` runs.
+   - **Move 2 (Resolve tensions):** Probe failure boundaries (`contradicts` / `qualifies` / `tradeoff`).
+   - **Move 3 (Combine wins):** Pair `clean` siblings (`win`, `efficiency_win`, or compounding `marginal` wins whose projected $\Delta_1 + \Delta_2 \ge \tau$).
+   - **Move 4 (Strip complexity):** Leave-one-out `probe`/`proxy` ablations on multi-intervention wins.
+   - **Move 5 (Expand regimes):** Cover untested `(task, arch_scale)` cells from `goal.target_regimes` and `scope.untested`.
+   - **Move 6 (Diagnose frontier):** Form abductive hypotheses from top frontier runs' observations and diagnostic metrics.
+3. **Prescribe concrete, ranked experiments:** Rank proposals by **expected information gain per GPU-hour** (using `estimated_gpu_hours`). For each recommended experiment, specify:
+   - **Baseline run** (`parent_runs` / `baseline`)
+   - **Exact intervention / config diff** (following `key=value` grammar)
+   - **Tier** (`probe` for cheap falsification, `proxy`/`full` for confirmation)
+   - **Falsification criterion** (what metric outcome supports vs. contradicts the Claim).
