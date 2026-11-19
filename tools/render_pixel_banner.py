@@ -1048,6 +1048,18 @@ def render_sky_layer_from_field(
             if rgb_lum(col) - rgb_lum(sky_c) > 20.0:
                 c.set_px(x, y, quantize_pixel_bayer(x, y, col, palette, dither_strength=0.0))
 
+    # Add a few dimmer pinprick stars in the darker indigo upper-left sky (fading out toward eastern dawn)
+    faint_west_stars: Sequence[Tuple[int, int, RGBA]] = (
+        (22, 16, (148, 146, 178, 255)),
+        (37, 46, (134, 132, 162, 255)),
+        (18, 62, (122, 120, 148, 255)),
+        (104, 11, (168, 166, 196, 255)),
+        (116, 36, (138, 136, 166, 255)),
+        (184, 19, (154, 150, 180, 255)),
+    )
+    for sx, sy, scol in faint_west_stars:
+        c.set_px(sx, sy, scol)
+
     # Render the crescent moon in the upper-center twilight sky
     draw_crescent_moon(c, cx=222.0, cy=34.0)
 
@@ -1086,6 +1098,17 @@ def render_background_mountains_layer(
     palette: Sequence[RGB],
 ) -> Canvas:
     c = Canvas(NATIVE_W, NATIVE_H)
+
+    # Curated twilight valley-mist tones so Bayer dithering forms smooth atmospheric haze
+    mist_tones: List[RGB] = [
+        (46, 52, 76),
+        (64, 69, 96),
+        (84, 86, 114),
+        (106, 102, 130),
+        (126, 118, 144),
+    ]
+    mtn_palette: List[RGB] = list(palette) + mist_tones
+
     for x in range(185, NATIVE_W):
         y_top = get_mountain_skyline_y(grid, x)
         # Stop cleanly at the foreground cliff on the left (x < 238) and at the midground ridge for x >= 238
@@ -1110,7 +1133,36 @@ def render_background_mountains_layer(
                 elif x >= 370 and cand[0] > 215 and cand[1] > 145 and y + 2 < NATIVE_H:
                     src_y = min(NATIVE_H - 1, y + 2)
             col = grid[src_y][src_x]
-            c.set_px(x, y, quantize_pixel_bayer(x, y, col, palette, dither_strength=0.35))
+
+            # Morning alpine valley mist pooled behind the midground ridge & across the eastern gorge
+            if x >= 242 and y >= 134:
+                dy_floor = max(0.0, float(y_bot - y))
+                east_t = max(0.0, min(1.0, (x - 335.0) / 105.0))
+                # Mist clings along the ridge saddle AND pools horizontally across the lower-right basin (y >= 170)
+                mist_band_h = 34.0 + 38.0 * east_t
+                floor_falloff = (1.0 - dy_floor / mist_band_h) ** 1.25 if dy_floor < mist_band_h else 0.0
+                basin_falloff = max(0.0, min(1.0, (y - 166.0) / 56.0)) * east_t * 0.82
+                base_falloff = max(floor_falloff, basin_falloff)
+                if base_falloff > 0.02:
+                    # Stratified horizontal mist ribbons via anisotropic noise
+                    wisp = 0.64 + 0.36 * value_noise(x / 36.0, y / 7.5, 419)
+                    # Keep bright sunlit alpine snow faces clear; veil settles in shaded valleys
+                    lum_m = rgb_lum(col)
+                    shade_w = max(0.20, min(1.0, (132.0 - lum_m) / 72.0))
+                    max_alpha = 0.34 + 0.34 * east_t
+                    mist_a = max(0.0, min(max_alpha, base_falloff * wisp * shade_w * max_alpha * 1.18))
+                    if mist_a > 0.03:
+                        # Cool lavender-indigo twilight mist warming subtly toward dusty lilac in the east
+                        mr = 92.0 + 34.0 * east_t
+                        mg = 94.0 + 22.0 * east_t
+                        mb = 124.0 + 20.0 * east_t
+                        col = (
+                            int(round(col[0] * (1.0 - mist_a) + mr * mist_a)),
+                            int(round(col[1] * (1.0 - mist_a) + mg * mist_a)),
+                            int(round(col[2] * (1.0 - mist_a) + mb * mist_a)),
+                        )
+
+            c.set_px(x, y, quantize_pixel_bayer(x, y, col, mtn_palette, dither_strength=0.38))
 
     # Draw continuous, uniform 1px dark border along the entire mountain skyline
     draw_uniform_top_border(
@@ -1130,8 +1182,52 @@ def render_midground_ridge_layer(
     c = Canvas(NATIVE_W, NATIVE_H)
     hut_mask = masks["alpine_hut"]
 
+    # Curated twilight alpine pine, moss, and sunlit sage-olive greens for ridge meadows
+    alpine_greens: List[RGB] = [
+        (22, 34, 34),    # deep pine-slate shadow
+        (32, 46, 38),    # shaded conifer / dusky moss
+        (44, 60, 44),    # weathered alpine moss
+        (60, 74, 48),    # muted sage-olive turf
+        (78, 90, 56),    # sunlit alpine meadow
+        (104, 110, 66),  # warm dawn olive slope
+        (134, 132, 82),  # golden-sage sunlit crest
+    ]
+    ridge_palette: List[RGB] = list(palette) + alpine_greens
+
+    def _alpine_green_for_lum(lum: float) -> RGB:
+        # Piecewise luminance-matched alpine green target so slopes keep natural shading
+        stops = (
+            (28.0, (22.0, 34.0, 34.0)),
+            (54.0, (42.0, 58.0, 43.0)),
+            (84.0, (68.0, 82.0, 52.0)),
+            (122.0, (104.0, 110.0, 66.0)),
+            (172.0, (144.0, 140.0, 88.0)),
+        )
+        if lum <= stops[0][0]:
+            t = stops[0][1]
+            return (int(t[0]), int(t[1]), int(t[2]))
+        for i in range(len(stops) - 1):
+            l0, c0 = stops[i]
+            l1, c1 = stops[i + 1]
+            if lum <= l1:
+                u = (lum - l0) / (l1 - l0)
+                return (
+                    int(round(c0[0] + (c1[0] - c0[0]) * u)),
+                    int(round(c0[1] + (c1[1] - c0[1]) * u)),
+                    int(round(c0[2] + (c1[2] - c0[2]) * u)),
+                )
+        t = stops[-1][1]
+        return (int(t[0]), int(t[1]), int(t[2]))
+
+    # Top boundary of alpine vegetation zone (keeps jagged upper peak rock mostly bare)
+    veg_top_curve: List[Point] = [
+        (236, 198), (275, 194), (315, 198), (345, 196),
+        (372, 178), (402, 190), (430, 214), (479, 240),
+    ]
+
     for x in range(236, NATIVE_W):
         y_top = get_mid_ridge_y(grid, x)
+        y_veg = interp_y(veg_top_curve, x)
         for y in range(y_top, NATIVE_H):
             src_x, src_y = x, y
             if x <= int(round(interp_x(CLIFF_RIGHT_WALL_POLY, y))) + 1:
@@ -1145,7 +1241,32 @@ def render_midground_ridge_layer(
                 if rgb_lum(cand) < 28.0 and y + 2 < NATIVE_H and x >= 325:
                     src_y = min(NATIVE_H - 1, y + 2)
             col = grid[src_y][src_x]
-            c.set_px(x, y, quantize_pixel_bayer(x, y, col, palette, dither_strength=0.32))
+            r, g, b = col
+            lum = rgb_lum(col)
+
+            # Blend organic muted alpine-green hues onto grassy slopes & mossy terraces
+            if y >= y_veg - 6 and lum >= 26.0:
+                elev_w = max(0.0, min(1.0, (y - (y_veg - 6.0)) / 18.0))
+                # Preserve cold deep-blue rock shadow crags and bright warm gravel trail highlights
+                rock_blue = max(0.0, min(1.0, (b - r - 6.0) / 22.0))
+                scree_trail = max(0.0, min(1.0, (lum - 138.0) / 55.0)) if (290 <= x <= 362 and 212 <= y <= 246) else 0.0
+                # Multi-scale organic moss/meadow patchiness so rocky ribs still peek through
+                n_macro = value_noise(x / 17.0, y / 11.0, 911)
+                n_detail = value_noise(x / 6.5, y / 5.5, 929)
+                patch = max(0.0, min(1.0, (n_macro * 0.65 + n_detail * 0.35 - 0.28) / 0.56))
+                # Stronger moss/turf presence on the sweeping slopes around the hut and right shoulder
+                slope_boost = 1.0 if (x >= 352 and y <= 235) else (0.90 if y <= 244 else 0.72)
+                green_w = elev_w * patch * slope_boost * (1.0 - 0.80 * rock_blue) * (1.0 - 0.75 * scree_trail)
+                green_w = max(0.0, min(0.72, green_w * 0.82))
+                if green_w > 0.05:
+                    tgt = _alpine_green_for_lum(lum)
+                    col = (
+                        int(round(r * (1.0 - green_w) + tgt[0] * green_w)),
+                        int(round(g * (1.0 - green_w) + tgt[1] * green_w)),
+                        int(round(b * (1.0 - green_w) + tgt[2] * green_w)),
+                    )
+
+            c.set_px(x, y, quantize_pixel_bayer(x, y, col, ridge_palette, dither_strength=0.34))
 
     # Draw continuous, uniform 1px dark border along the entire mid-ground ridge top contour
     draw_uniform_top_border(
@@ -1199,7 +1320,7 @@ def render_foreground_cliff_layer(
                         break
                 if in_prop:
                     break
-            if in_prop or (186 <= x <= 225 and 119 <= y <= 137):
+            if in_prop or (186 <= x <= 225 and 119 <= y <= 137) or (191 <= x <= 212 and 138 <= y <= 140):
                 bad_plat[y][x] = True
                 continue
 
@@ -1246,6 +1367,14 @@ def render_foreground_cliff_layer(
     snow_cool: RGB = (116, 134, 156)
     snow_lit: RGB = (176, 184, 204)
 
+    # Muted high-altitude lichen / crevice moss accents echoing the midground alpine greens
+    cliff_lichen: List[RGB] = [
+        (38, 48, 42),   # dark damp crevice moss
+        (56, 68, 50),   # weathered sage-olive lichen
+        (78, 86, 58),   # sunlit alpine rock lichen
+    ]
+    cliff_palette: List[RGB] = list(palette) + cliff_lichen
+
     for y in range(102, NATIVE_H):
         max_x = int(round(interp_x(CLIFF_RIGHT_WALL_POLY, y))) if y >= 138 else 236
         for x in range(0, min(NATIVE_W, max_x + 1)):
@@ -1255,7 +1384,28 @@ def render_foreground_cliff_layer(
 
             if not bad_plat[y][x]:
                 col = grid[y][x]
-                c.set_px(x, y, quantize_pixel_bayer(x, y, col, palette, dither_strength=0.32))
+                y_lip_here = int(round(interp_y(lip_front_1x, x))) if x <= 236 else 138
+                if y >= y_lip_here + 2 and x <= max_x - 3:
+                    r, g, b = col
+                    lum = rgb_lum(col)
+                    is_snow = (b > r + 15 and lum > 105.0)
+                    is_orange_rim = (r > b + 30)
+                    if 40.0 <= lum <= 118.0 and not is_snow and not is_orange_rim:
+                        near_crack = False
+                        for dx, dy in ((0, 1), (0, 2), (0, -1), (-1, 1), (1, 1)):
+                            nx, ny = x + dx, y + dy
+                            if 0 <= nx < NATIVE_W and 0 <= ny < NATIVE_H and rgb_lum(grid[ny][nx]) < 34.0:
+                                near_crack = True
+                                break
+                        if near_crack:
+                            p_macro = value_noise(x, y, 16.0, 613)
+                            p_fine = value_noise(x, y, 5.5, 641)
+                            patch = p_macro * 0.65 + p_fine * 0.35
+                            if patch > 0.58:
+                                lichen_w = min(0.76, (patch - 0.58) / 0.24 * 0.76)
+                                tgt = cliff_lichen[0] if lum < 58.0 else (cliff_lichen[1] if lum < 86.0 else cliff_lichen[2])
+                                col = _lerp_rgb(col, tgt, lichen_w)
+                c.set_px(x, y, quantize_pixel_bayer(x, y, col, cliff_palette, dither_strength=0.32))
                 continue
 
             # Horizon outline along upper edge where sky/mountains sit behind removed cairn
@@ -1538,15 +1688,14 @@ def render_polished_theodolite_sprite_2x() -> Canvas:
     hspan(279, 287, 293, [P["BRASS_SHAD"], P["BRASS_BRONZE"], P["BRASS_GOLD"], P["BRASS_BRIGHT"]], P["INK_SHADOW"], P["OUTLINE_BRONZE"])
     hspan(280, 288, 292, [P["INK_SHADOW"], P["BRASS_SHAD"], P["BRASS_BRONZE"], P["BRASS_GOLD"]], P["INK_SHADOW"], P["OUTLINE_BRONZE"])
     for y in range(281, 311):
-        u = (y - 281) / 29.0
-        half_w = 2 if u < 0.55 else (1 if u < 0.85 else 0)
-        cx_spike = int(round(290.0 - u * 1.2))
-        if half_w == 2:
-            hspan(y, cx_spike - 2, cx_spike + 1, [P["BRASS_SHAD"], P["BRASS_GOLD"], P["BRASS_GLEAM"], P["BRASS_SPEC"]], P["INK_SHADOW"], P["OUTLINE_BRONZE"])
-        elif half_w == 1:
-            hspan(y, cx_spike - 1, cx_spike + 1, [P["BRASS_GOLD"], P["BRASS_GLEAM"], P["BRASS_SPEC"]], P["INK_SHADOW"], P["OUTLINE_BRONZE"])
+        if y <= 292:
+            hspan(y, 288, 291, [P["BRASS_SHAD"], P["BRASS_GOLD"], P["BRASS_GLEAM"], P["BRASS_SPEC"]], P["INK_SHADOW"], P["OUTLINE_BRONZE"])
+        elif y <= 303:
+            hspan(y, 288, 290, [P["BRASS_GOLD"], P["BRASS_GLEAM"], P["BRASS_SPEC"]], P["INK_SHADOW"], P["OUTLINE_BRONZE"])
+        elif y <= 308:
+            hspan(y, 288, 289, [P["BRASS_GLEAM"], P["BRASS_SPEC"]], P["INK_SHADOW"], P["OUTLINE_BRONZE"])
         else:
-            hspan(y, cx_spike, cx_spike, [P["BRASS_SPEC"]], P["INK_SHADOW"], P["OUTLINE_BRONZE"])
+            hspan(y, 289, 289, [P["BRASS_SPEC"]], P["INK_SHADOW"], P["OUTLINE_BRONZE"])
     c.set_px(289, 311, P["INK_SHADOW"])
 
     # ==========================================================================
@@ -2059,14 +2208,15 @@ def render_faithful_cairn_sprite_2x(
         (134, 270), (96, 282), (42, 281), (38, 260), (54, 224),
     ]
     stone3_leg_arch: List[Point] = [(223, 197), (236, 196), (249, 202), (263, 210), (271, 216), (277, 222)]
-    # Bottom contour stripping out the baked ground shadow on left AND exposed slate slab on far right
+    # Gently scalloped boulder-base contour (follows each foot boulder belly instead of a ruler-straight diagonal)
     base_floor_pts: List[Point] = [
-        (38, 278), (74, 282), (104, 274), (124, 268), (168, 260),
-        (210, 254), (248, 248), (278, 240),
+        (42, 274), (50, 278), (66, 281), (82, 280), (98, 276), (118, 271),
+        (132, 267), (156, 265), (178, 260), (184, 258), (206, 256),
+        (224, 252), (230, 250), (254, 248), (270, 243), (278, 237),
     ]
 
     for y in range(31, 285):
-        for x in range(38, 280):
+        for x in range(40, 280):
             if y > int(round(interp_y(base_floor_pts, x))):
                 continue
             col = grid_fg[y][x]
@@ -2082,13 +2232,16 @@ def render_faithful_cairn_sprite_2x(
                 # Exclude twilight purple sky above the sloping right foot (x > 206, y < 226)
                 if x > 206 and y < 226 and b > r + 2 and lum > 50.0:
                     continue
+                # Exclude faint background-slate fringe clinging to the far-left lower flank
+                if x <= 56 and y >= 248 and b > r + 4 and lum > 38.0:
+                    continue
                 # Keep warm stone foot & dark boulder crevices; exclude exposed blue-slate platform
                 if not is_platform_slate_or_shadow(col) or (68 <= x <= 204 and y <= 258):
                     cairn_mask[y][x] = True
 
     # Fill interior stone/shadow gaps without bridging across the sky cleft above Stone 3 (x=202..224, y=194..206)
-    fill_scanline_spans(cairn_mask, 32, 276, 38, 200)
-    fill_scanline_spans(cairn_mask, 206, 250, 200, 279)
+    fill_scanline_spans(cairn_mask, 32, 281, 40, 200)
+    fill_scanline_spans(cairn_mask, 206, 256, 200, 279)
     despike_mask(cairn_mask, min_neighbors=2)
 
     # 2. Build generous occlusion mask covering:
@@ -2375,11 +2528,11 @@ def render_faithful_cairn_sprite_2x(
         cairn_mask[ty][tx] = False
         reconstructed.pop((tx, ty), None)
 
-    # Remove single-pixel outer sky spurs (<= 1 cardinal neighbor) without altering interior pixels
+    # Remove single-pixel outer spurs (<= 1 cardinal neighbor) across full cairn perimeter
     spurs: List[Tuple[int, int]] = []
-    for y in range(31, 234):
+    for y in range(31, 284):
         for x in range(38, 280):
-            if not cairn_mask[y][x] or not _is_sky_zone(x, y):
+            if not cairn_mask[y][x]:
                 continue
             n4 = sum(1 for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)) if cairn_mask[y + dy][x + dx])
             if n4 <= 1:
@@ -2391,11 +2544,11 @@ def render_faithful_cairn_sprite_2x(
     for (x, y), col in reconstructed.items():
         c.set_px(x, y, quantize_pixel_bayer(x, y, col, palette, dither_strength=0.22))
 
-    # 5. Apply a clean, uniform 1px dark pixel-art outline strictly along the sky-facing perimeter
+    # 5. Apply a clean, uniform 1px dark pixel-art outline along the sky perimeter AND lower boulder base
     sky_border_col: RGBA = (18, 14, 24, 255)
-    for y in range(31, 234):
+    for y in range(31, 284):
         for x in range(38, 280):
-            if not cairn_mask[y][x] or not _is_sky_zone(x, y):
+            if not cairn_mask[y][x]:
                 continue
             if any(not cairn_mask[y + dy][x + dx] for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))):
                 c.set_px(x, y, sky_border_col)
@@ -2464,14 +2617,14 @@ def render_weathered_gloves_sprite_2x(palette: Optional[Sequence[RGB]] = None) -
     # 2. Front / top glove: rounded weathered leather cuff + knuckle palm + 4 chunky splayed fingers + thumb
     front_cuff_palm: List[Point] = [
         (185, 291), (192, 283), (212, 281), (229, 285), (240, 294),
-        (235, 308), (222, 318), (206, 307), (190, 301), (185, 296),
+        (235, 308), (222, 317), (214, 314), (203, 306), (190, 300), (185, 296),
     ]
     front_fingers: List[Tuple[Point, Point, float]] = [
         ((224.0, 291.5), (239.0, 295.0), 2.75),  # tucked thumb
         ((229.0, 298.5), (243.5, 307.0), 2.95),  # index finger
         ((223.5, 303.5), (238.5, 313.5), 2.95),  # middle finger
         ((218.0, 308.5), (232.0, 318.0), 2.85),  # ring finger
-        ((213.0, 313.0), (225.0, 321.5), 2.65),  # pinky finger
+        ((215.0, 312.5), (225.0, 319.5), 2.45),  # pinky finger (aligned smoothly with outer palm)
     ]
 
     for y in range(279, 326):
@@ -2503,13 +2656,13 @@ def render_weathered_gloves_sprite_2x(palette: Optional[Sequence[RGB]] = None) -
                 val[y][x] = max(0.06, min(0.88, v))
             else:
                 gid[y][x] = 2
+                # Soft leather wrist-cuff fold shading (no harsh dark line slicing across the glove)
                 cuff_seam_x = 200.0 + (py - 282.0) * 0.45
-                if abs(px - cuff_seam_x) <= 0.80:
-                    seam_px.add((x, y))
+                cuff_fold = -0.16 * math.exp(-((px - cuff_seam_x) / 1.9) ** 2)
                 knuckle_bump = 0.34 * math.exp(-(((px - 222.0) / 11.0) ** 2 + ((py - 294.0) / 6.5) ** 2))
-                cuff_rim = 0.14 if abs(px - (cuff_seam_x - 3.0)) <= 2.2 and py < 296.0 else 0.0
+                cuff_rim = 0.12 if abs(px - (cuff_seam_x - 3.0)) <= 2.2 and py < 296.0 else 0.0
                 shade_bot = -0.28 * max(0.0, (py - 295.0) / 14.0)
-                v = 0.38 + knuckle_bump + cuff_rim + shade_bot + grain
+                v = 0.38 + knuckle_bump + cuff_rim + cuff_fold + shade_bot + grain
                 val[y][x] = max(0.05, min(0.95, v))
 
     # 3. Render muted leather colors + crisp 1px inter-finger seams + uniform 1px outer outline
@@ -2718,17 +2871,17 @@ def render_alpine_hut_sprite_2x(hut_scale: float = 0.76) -> Canvas:
     def _hpt(px: float, py: float) -> Point:
         return (piv_x + (px - piv_x) * hut_scale, piv_y + (py - piv_y) * hut_scale)
 
-    outline_col: RGBA = (16, 16, 26, 255)
-    roof_shad: List[RGBA] = [(54, 62, 86, 255), (78, 86, 112, 255)]
-    roof_lit: List[RGBA] = [(134, 142, 164, 255), (168, 174, 192, 255), (198, 200, 214, 255)]
+    outline_col: RGBA = (20, 22, 32, 255)
+    roof_shad: List[RGBA] = [(44, 50, 72, 255), (66, 72, 96, 255)]
+    roof_lit: List[RGBA] = [(126, 122, 134, 255), (156, 146, 150, 255), (186, 168, 160, 255)]
     eave_shad: RGBA = (24, 20, 32, 255)
-    wall_left_cols: List[RGBA] = [(44, 50, 72, 255), (62, 68, 92, 255)]
-    wall_right_cols: List[RGBA] = [(92, 62, 52, 255), (122, 84, 64, 255), (144, 102, 74, 255)]
-    base_stone: List[RGBA] = [(42, 46, 62, 255), (62, 66, 84, 255)]
-    win_frame: RGBA = (142, 134, 136, 255)
-    win_pane: RGBA = (26, 26, 38, 255)
-    win_dim: RGBA = (78, 62, 54, 255)
-    door_col: RGBA = (24, 18, 26, 255)
+    wall_left_cols: List[RGBA] = [(34, 40, 58, 255), (50, 56, 76, 255)]
+    wall_right_cols: List[RGBA] = [(88, 60, 48, 255), (118, 82, 60, 255), (142, 102, 72, 255)]
+    base_stone: List[RGBA] = [(34, 40, 48, 255), (52, 56, 64, 255)]
+    win_frame: RGBA = (128, 114, 106, 255)
+    win_pane: RGBA = (24, 24, 34, 255)
+    win_dim: RGBA = (68, 54, 46, 255)
+    door_col: RGBA = (22, 18, 26, 255)
 
     # Interior kind tag: 0=empty, 1=chimney, 2=left_wall, 3=right_wall, 4=roof_left, 5=roof_right
     kind = [[0 for _ in range(FG_W)] for _ in range(FG_H)]
@@ -2772,14 +2925,14 @@ def render_alpine_hut_sprite_2x(hut_scale: float = 0.76) -> Canvas:
                 kind[y][x] = 4
                 v = (py - r_y0) / max(1.0, r_h)
                 if px <= barge_x and py <= barge_y:
-                    px_col[(x, y)] = (164, 172, 190, 255)
+                    px_col[(x, y)] = (146, 140, 150, 255)
                 elif v >= 0.86:
                     px_col[(x, y)] = eave_shad
                 else:
                     px_col[(x, y)] = roof_shad[1] if (px > roof_left_mid_x and v < 0.65) else roof_shad[0]
             elif point_in_poly(px, py, chimney_poly):
                 kind[y][x] = 1
-                px_col[(x, y)] = (138, 126, 134, 255) if (y <= chim_top_y or px >= chim_lit_x) else (76, 78, 96, 255)
+                px_col[(x, y)] = (136, 120, 116, 255) if (y <= chim_top_y or px >= chim_lit_x) else (62, 64, 82, 255)
             elif point_in_poly(px, py, left_wall_poly):
                 kind[y][x] = 2
                 if py >= base_y:
@@ -2974,12 +3127,12 @@ def render_right_cobbles_sprite_2x() -> Canvas:
 
 def render_platform_cobbles_sprite_2x() -> Canvas:
     """
-    Subtle, low-profile weathered granite cobbles scattered in unobstructed spots on
-    the stone platform (left-front plateau, center-front apron, and far-right brink),
-    using softer granite outlines so they sit naturally into the rock bench.
+    Subtle, low-profile weathered granite cobbles and pebbles strewn naturally across
+    unobstructed areas of the stone platform, with color temperature warming from cool
+    slate on the left to sunlit taupe-ochre toward the eastern rim.
     """
     stone_specs = [
-        # Front-left plateau (well below cairn boulders, well left of ice axe shaft)
+        # 1. Front-left plateau (below cairn boulders, left of ice axe shaft)
         {
             "poly": [(43, 295), (50, 291), (61, 292), (65, 299), (55, 303), (44, 300)],
             "dark": (48, 44, 54),
@@ -3008,7 +3161,22 @@ def render_platform_cobbles_sprite_2x() -> Canvas:
             "ry": 5.0,
             "seed": 709,
         },
-        # Center-front apron (clear between ice axe ferrule and leather gloves)
+        # 2. Lower-left stray angular chip (below ice axe tip shadow, near front lip)
+        {
+            "poly": [(85, 323), (92, 321), (97, 325), (91, 329), (84, 327)],
+            "dark": (48, 44, 54),
+            "mid": (84, 77, 84),
+            "warm": (126, 112, 106),
+            "hi": (166, 148, 134),
+            "cx": 90.5,
+            "cy": 325.0,
+            "lx": 93.0,
+            "ly": 323.0,
+            "rx": 7.5,
+            "ry": 4.5,
+            "seed": 713,
+        },
+        # 3. Center-front apron (clear between ice axe ferrule and leather gloves)
         {
             "poly": [(132, 325), (141, 322), (153, 324), (156, 330), (144, 333), (133, 330)],
             "dark": (50, 45, 55),
@@ -3037,11 +3205,127 @@ def render_platform_cobbles_sprite_2x() -> Canvas:
             "ry": 4.5,
             "seed": 727,
         },
+        # 4. Front-center-right open granite triangle (below gloves & left of center tripod foot)
+        {
+            "poly": [(246, 338), (255, 334), (266, 336), (269, 343), (257, 346), (245, 343)],
+            "dark": (52, 46, 56),
+            "mid": (92, 83, 86),
+            "warm": (142, 122, 108),
+            "hi": (184, 160, 138),
+            "cx": 257.0,
+            "cy": 340.0,
+            "lx": 262.0,
+            "ly": 337.0,
+            "rx": 13.0,
+            "ry": 7.0,
+            "seed": 733,
+        },
+        {
+            "poly": [(232, 344), (239, 342), (243, 347), (236, 349), (231, 347)],
+            "dark": (50, 44, 54),
+            "mid": (86, 78, 84),
+            "warm": (132, 116, 104),
+            "hi": (172, 150, 132),
+            "cx": 237.0,
+            "cy": 345.5,
+            "lx": 239.5,
+            "ly": 344.0,
+            "rx": 7.0,
+            "ry": 4.5,
+            "seed": 739,
+        },
+        {
+            "poly": [(276, 332), (282, 330), (286, 334), (280, 337), (275, 335)],
+            "dark": (52, 46, 54),
+            "mid": (94, 84, 86),
+            "warm": (144, 124, 108),
+            "hi": (184, 160, 138),
+            "cx": 280.5,
+            "cy": 333.5,
+            "lx": 283.0,
+            "ly": 332.0,
+            "rx": 6.5,
+            "ry": 4.0,
+            "seed": 743,
+        },
+        # 5. Front-right brink apron (clear below center tripod foot and left-front of notebook)
+        {
+            "poly": [(301, 321), (308, 318), (315, 321), (313, 326), (304, 326), (300, 324)],
+            "dark": (52, 46, 56),
+            "mid": (96, 86, 86),
+            "warm": (148, 126, 108),
+            "hi": (190, 166, 140),
+            "cx": 307.5,
+            "cy": 322.5,
+            "lx": 311.0,
+            "ly": 320.5,
+            "rx": 8.5,
+            "ry": 5.0,
+            "seed": 751,
+        },
+        {
+            "poly": [(316, 324), (321, 323), (323, 327), (318, 328), (315, 326)],
+            "dark": (52, 46, 54),
+            "mid": (94, 84, 84),
+            "warm": (144, 124, 106),
+            "hi": (184, 160, 136),
+            "cx": 319.0,
+            "cy": 325.5,
+            "lx": 320.5,
+            "ly": 324.5,
+            "rx": 5.0,
+            "ry": 3.5,
+            "seed": 757,
+        },
+        # 6. Mid-back bench framed cleanly between center & right tripod legs
+        {
+            "poly": [(310, 254), (319, 250), (328, 252), (330, 258), (320, 260), (310, 258)],
+            "dark": (54, 48, 56),
+            "mid": (100, 88, 86),
+            "warm": (154, 128, 106),
+            "hi": (196, 168, 138),
+            "cx": 320.0,
+            "cy": 255.0,
+            "lx": 324.5,
+            "ly": 253.0,
+            "rx": 11.0,
+            "ry": 6.0,
+            "seed": 761,
+        },
+        {
+            "poly": [(332, 256), (338, 255), (340, 259), (335, 261), (331, 259)],
+            "dark": (52, 46, 54),
+            "mid": (96, 86, 84),
+            "warm": (148, 124, 104),
+            "hi": (190, 164, 136),
+            "cx": 335.5,
+            "cy": 258.0,
+            "lx": 337.5,
+            "ly": 256.5,
+            "rx": 5.5,
+            "ry": 3.5,
+            "seed": 769,
+        },
+        # 7. Stray sunlit chip rolled slightly left of the main right-brink cobbles
+        {
+            "poly": [(362, 255), (369, 252), (375, 255), (372, 260), (364, 260), (361, 258)],
+            "dark": (54, 48, 56),
+            "mid": (104, 90, 86),
+            "warm": (160, 134, 110),
+            "hi": (202, 176, 144),
+            "cx": 368.0,
+            "cy": 256.5,
+            "lx": 371.5,
+            "ly": 254.5,
+            "rx": 8.0,
+            "ry": 4.5,
+            "seed": 773,
+        },
     ]
     return _render_cobble_cluster_2x(
         stone_specs,
-        (40, 170),
-        (288, 338),
+        (40, 380),
+        (248, 353),
         outline_col=(36, 32, 42, 255),
         crevice_col=(34, 30, 40, 255),
     )
@@ -3160,7 +3444,7 @@ def apply_composite_shadows_2x(
     if s_cobbles is not None:
         low_prop_specs.append((s_cobbles, 8.0, 0.76, 0.56, (376, 448), (236, 278)))
     if s_platform_cobbles is not None:
-        low_prop_specs.append((s_platform_cobbles, 4.0, 0.56, 0.36, (38, 172), (286, 340)))
+        low_prop_specs.append((s_platform_cobbles, 4.0, 0.56, 0.36, (38, 382), (246, 355)))
     for sprite, elev, ao_str, cast_str, (x_lo, x_hi), (y_lo, y_hi) in low_prop_specs:
         for y in range(y_lo, y_hi):
             for x in range(x_lo, x_hi):
@@ -3371,67 +3655,21 @@ def build_fg_prop_masks_2x(
             if gloves_ref.get_px(x, y)[3] > 0:
                 fg_masks["gloves"][y][x] = True
 
-    # 4. COILED ROPE at 960x540 (2x) — tightly isolated to main rope coil without trailing tail
+    # 4. COILED ROPE at 960x540 (2x) — solid, coherent rounded coil silhouette without ragged tail/fuzz
     coil_2x: List[Point] = [
-        (127, 276), (133, 257), (150, 250), (174, 251), (190, 246),
-        (209, 233), (225, 227), (242, 230), (256, 238), (265, 254),
-        (266, 270), (258, 280), (236, 281), (208, 282),
-        (191, 288), (185, 297), (153, 299), (133, 292),
+        (129, 273), (132, 260), (141, 253), (158, 251), (176, 252),
+        (189, 247), (204, 236), (218, 229), (231, 228), (242, 233),
+        (251, 243), (256, 256), (255, 268), (248, 277), (235, 281),
+        (216, 281), (195, 285), (182, 293), (162, 295), (144, 291),
+        (133, 283),
     ]
-    for y in range(226, 302):
+    for y in range(226, 298):
         for x in range(126, 268):
             if fg_masks["gloves"][y][x] or fg_masks["ice_axe"][y][x]:
                 continue
-            col = grid_fg[y][x]
-            r, g, b = col
-            lum = rgb_lum(col)
-            if point_in_poly(x, y, coil_2x):
-                if is_platform_slate_or_shadow(col) or (b >= r + 1 and lum > 30.0) or (x < 140 and y > 280 and b > r + 4):
-                    continue
+            if point_in_poly(x + 0.5, y + 0.5, coil_2x):
                 fg_masks["rope"][y][x] = True
-    fill_scanline_spans(
-        fg_masks["rope"], 228, 286, 127, 266,
-        exclude_masks=[fg_masks["gloves"], fg_masks["ice_axe"]],
-    )
     despike_mask(fg_masks["rope"], min_neighbors=2)
-    # Trim stray 1px background slate/twilight/shadow fringe on coil perimeter
-    for _ in range(2):
-        trim_rope: List[Tuple[int, int]] = []
-        for y in range(226, 302):
-            for x in range(126, 268):
-                if not fg_masks["rope"][y][x]:
-                    continue
-                if any(not fg_masks["rope"][y + dy][x + dx] for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))):
-                    col = grid_fg[y][x]
-                    if is_platform_slate_or_shadow(col) or (col[2] >= col[0] and rgb_lum(col) > 24.0) or (x < 142 and y > 278 and col[2] > col[0] + 3):
-                        trim_rope.append((x, y))
-        for tx, ty in trim_rope:
-            fg_masks["rope"][ty][tx] = False
-        despike_mask(fg_masks["rope"], min_neighbors=2)
-    # Keep only the single main connected component of the rope coil (drops any stray detached dots)
-    visited_r = [[False for _ in range(FG_W)] for _ in range(FG_H)]
-    comps_r: List[List[Tuple[int, int]]] = []
-    for y in range(226, 302):
-        for x in range(126, 268):
-            if fg_masks["rope"][y][x] and not visited_r[y][x]:
-                stack = [(x, y)]
-                visited_r[y][x] = True
-                comp: List[Tuple[int, int]] = []
-                while stack:
-                    cx, cy = stack.pop()
-                    comp.append((cx, cy))
-                    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)):
-                        nx, ny = cx + dx, cy + dy
-                        if 0 <= nx < FG_W and 0 <= ny < FG_H and fg_masks["rope"][ny][nx] and not visited_r[ny][nx]:
-                            visited_r[ny][nx] = True
-                            stack.append((nx, ny))
-                comps_r.append(comp)
-    if comps_r:
-        main_comp = max(comps_r, key=len)
-        for comp in comps_r:
-            if comp is not main_comp:
-                for cx, cy in comp:
-                    fg_masks["rope"][cy][cx] = False
 
     # 5. STACKED STONE CAIRN at 960x540 (2x)
     cairn_lower_2x: List[Point] = [(x * 2, y * 2) for (x, y) in [
@@ -3461,6 +3699,191 @@ def build_fg_prop_masks_2x(
     return fg_masks
 
 
+def render_clean_rope_sprite_2x(
+    grid_fg: List[List[RGB]],
+    fg_masks: Dict[str, List[List[bool]]],
+    theo_canvas: Canvas,
+    palette: Sequence[RGB],
+) -> Canvas:
+    """
+    Renders a coherent, crisp, shadow-free 960x540 (2x) braided climbing rope sprite:
+      - Solid, hole-free rounded coil silhouette (no ragged bottom fuzz or flat cut edges).
+      - Preserves authentic twisted dark-hemp & sunlit ivory-tan interior strands from
+        `grid_fg`, bridging ONLY the narrow tripod-leg crossing along curved coil strands.
+      - Replaces washed-out background slate along outer turns with crisp braided outer
+        hemp strands and wraps the full sprite in a continuous 1px dark perimeter outline
+        so the coil separates cleanly from the granite platform and cairn behind it.
+    """
+    c = Canvas(FG_W, FG_H)
+    mask = fg_masks["rope"]
+
+    # Build a clean solid body mask (1px inset from final outline, including area behind gloves edge)
+    coil_solid_poly: List[Point] = [
+        (130, 273), (133, 261), (142, 254), (158, 252), (176, 253),
+        (189, 248), (204, 237), (218, 230), (231, 229), (242, 234),
+        (250, 244), (255, 256), (254, 268), (247, 276), (235, 280),
+        (216, 280), (195, 284), (182, 292), (162, 294), (144, 290),
+        (134, 282),
+    ]
+    body = [[False for _ in range(FG_W)] for _ in range(FG_H)]
+    for y in range(227, 297):
+        for x in range(128, 267):
+            if point_in_poly(x + 0.5, y + 0.5, coil_solid_poly):
+                body[y][x] = True
+
+    def is_theo_px(px: int, py: int) -> bool:
+        return theo_canvas.get_px(px, py)[3] > 0
+
+    def is_rope_leg_occ(px: int, py: int) -> bool:
+        r, g, b = grid_fg[py][px]
+        in_leg_strip = dist_point_to_seg(px, py, 254.0, 220.0, 238.5, 279.0) <= 5.4
+        in_ferrule = (256 <= py <= 279 and 236 <= px <= 247 and abs(r - g) < 18 and r > 62)
+        in_mahogany = (224 <= py <= 264 and 240 <= px <= 258 and r > g + 16 and r > b + 8 and r < 145)
+        return is_theo_px(px, py) or in_leg_strip or in_ferrule or in_mahogany
+
+    def is_bad_bg_bleed(px: int, py: int) -> bool:
+        col = grid_fg[py][px]
+        r, g, b = col
+        lum = rgb_lum(col)
+        return (
+            is_platform_slate_or_shadow(col)
+            or (b >= r + 4 and lum > 30.0)
+            or (py >= 278 and px >= 186 and fg_masks["gloves"][py][px])
+        )
+
+    # Precompute 1..3px rim distance inside `body`
+    rim_dist = [[9 for _ in range(FG_W)] for _ in range(FG_H)]
+    for y in range(227, 297):
+        for x in range(128, 267):
+            if not body[y][x]:
+                continue
+            if any(not body[y + dy][x + dx] for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))):
+                rim_dist[y][x] = 1
+    for d in (2, 3):
+        for y in range(227, 297):
+            for x in range(128, 267):
+                if body[y][x] and rim_dist[y][x] == 9:
+                    if any(rim_dist[y + dy][x + dx] == d - 1 for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))):
+                        rim_dist[y][x] = d
+
+    # Curated weathered climbing-rope hemp ramp for crisp outer turns & coherent edge definition
+    rope_dark: RGB = (30, 22, 26)
+    rope_shad: RGB = (58, 44, 42)
+    rope_mid: RGB = (96, 76, 64)
+    rope_warm: RGB = (146, 122, 98)
+    rope_hi: RGB = (188, 166, 134)
+
+    def _mix_rgb(a: RGB, b: RGB, t: float) -> RGB:
+        tt = max(0.0, min(1.0, t))
+        return (
+            int(round(a[0] + (b[0] - a[0]) * tt)),
+            int(round(a[1] + (b[1] - a[1]) * tt)),
+            int(round(a[2] + (b[2] - a[2]) * tt)),
+        )
+
+    for y in range(227, 297):
+        for x in range(128, 267):
+            if not body[y][x]:
+                continue
+
+            # 1. Obtain authentic interior rope pixel (or curved-strand bridge across leg / bg bleed)
+            if is_rope_leg_occ(x, y):
+                cx_r, cy_r = 224.0, 258.0
+                dx_c = (x - cx_r) / 1.32
+                dy_c = y - cy_r
+                rad = math.hypot(dx_c, dy_c)
+                ang = math.atan2(dy_c, dx_c)
+                cand_l: Optional[Tuple[float, RGB]] = None
+                cand_r: Optional[Tuple[float, RGB]] = None
+                for step in range(2, 26):
+                    d_ang = step * 0.055
+                    if cand_l is None:
+                        lx = int(round(cx_r + math.cos(ang - d_ang) * rad * 1.32))
+                        ly = int(round(cy_r + math.sin(ang - d_ang) * rad))
+                        if 0 <= lx < FG_W and 0 <= ly < FG_H and body[ly][lx] and not is_rope_leg_occ(lx, ly) and not is_bad_bg_bleed(lx, ly):
+                            cand_l = (d_ang, grid_fg[ly][lx])
+                    if cand_r is None:
+                        rx = int(round(cx_r + math.cos(ang + d_ang) * rad * 1.32))
+                        ry = int(round(cy_r + math.sin(ang + d_ang) * rad))
+                        if 0 <= rx < FG_W and 0 <= ry < FG_H and body[ry][rx] and not is_rope_leg_occ(rx, ry) and not is_bad_bg_bleed(rx, ry):
+                            cand_r = (d_ang, grid_fg[ry][rx])
+                    if cand_l is not None and cand_r is not None:
+                        break
+                if cand_l is not None and cand_r is not None:
+                    t_side = cand_l[0] / (cand_l[0] + cand_r[0])
+                    jit = (fbm_hash(x, y, 509) - 0.5) * 0.18
+                    col = cand_r[1] if (t_side + jit) > 0.5 else cand_l[1]
+                elif cand_l is not None:
+                    col = cand_l[1]
+                elif cand_r is not None:
+                    col = cand_r[1]
+                else:
+                    col = rope_shad
+            elif is_bad_bg_bleed(x, y):
+                # Pull clean interior braided hemp color instead of cold cliff slate or glove edge
+                col = rope_shad
+                found = False
+                for rad_s in (2, 4, 6, 8):
+                    for ox, oy in ((0, -rad_s), (rad_s, 0), (-rad_s, 0), (0, rad_s), (rad_s, -rad_s), (-rad_s, -rad_s)):
+                        nx, ny = x + ox, y + oy
+                        if 0 <= nx < FG_W and 0 <= ny < FG_H and body[ny][nx] and not is_rope_leg_occ(nx, ny) and not is_bad_bg_bleed(nx, ny):
+                            col = grid_fg[ny][nx]
+                            found = True
+                            break
+                    if found:
+                        break
+            else:
+                col = grid_fg[y][x]
+
+            # 2. Give the outer 2px rim clear braided hemp strand definition so edges never fade out
+            rd = rim_dist[y][x]
+            if rd <= 2:
+                # Approximate local outward normal from the clean body mask
+                nx_o, ny_o = 0.0, 0.0
+                for oy in (-2, -1, 0, 1, 2):
+                    for ox in (-2, -1, 0, 1, 2):
+                        if not body[y + oy][x + ox]:
+                            nx_o += ox
+                            ny_o += oy
+                nlen = math.hypot(nx_o, ny_o)
+                if nlen > 1e-4:
+                    nx_o /= nlen
+                    ny_o /= nlen
+                # Directional morning sun from top-right (+x, -y)
+                sun_rim = max(0.0, min(1.0, 0.45 + 0.42 * nx_o - 0.42 * ny_o))
+                # Twisted hemp braid notch pattern running around the outer coil turn
+                twist_wave = 0.5 + 0.5 * math.sin((x * 0.72 + y * 0.64) * 1.55)
+                if rd == 1:
+                    if twist_wave < 0.24:
+                        rim_col = rope_dark
+                    elif sun_rim > 0.58:
+                        rim_col = _mix_rgb(rope_warm, rope_hi, (sun_rim - 0.58) / 0.42 * twist_wave)
+                    elif sun_rim > 0.34:
+                        rim_col = _mix_rgb(rope_mid, rope_warm, twist_wave * 0.85)
+                    else:
+                        rim_col = _mix_rgb(rope_shad, rope_mid, twist_wave * 0.70)
+                    col = _mix_rgb(col, rim_col, 0.72)
+                else:
+                    # Subtle 2nd-pixel inner-rim bevel bridging cleanly into authentic interior strands
+                    if rgb_lum(col) < 42.0 and sun_rim > 0.55 and twist_wave > 0.45:
+                        col = _mix_rgb(col, rope_mid, 0.45)
+                    elif col[2] > col[0] + 2:
+                        col = _mix_rgb(col, rope_shad, 0.55)
+
+            c.set_px(x, y, quantize_pixel_bayer(x, y, col, palette, dither_strength=0.18))
+
+    # 3. Crisp continuous 1px dark exterior outline matching all other 960x540 sprites
+    outline_col: RGBA = (18, 14, 22, 255)
+    for y in range(226, 298):
+        for x in range(127, 268):
+            if body[y][x]:
+                continue
+            if any(body[y + dy][x + dx] for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))):
+                c.set_px(x, y, outline_col)
+
+    return c
+
+
 def render_fg_prop_sprite_2x(
     name: str,
     grid_fg: List[List[RGB]],
@@ -3481,11 +3904,17 @@ def render_fg_prop_sprite_2x(
         return theo_canvas.get_px(px, py)[3] > 0
 
     def is_rope_leg_occ(px: int, py: int) -> bool:
+        r, g, b = grid_fg[py][px]
+        # Tight mask around ONLY the actual narrow tripod left-leg shaft & ferrule in banner.jpg
+        in_leg_strip = dist_point_to_seg(px, py, 254.0, 220.0, 238.5, 279.0) <= 5.4
+        in_ferrule = (256 <= py <= 279 and 236 <= px <= 247 and abs(r - g) < 18 and r > 62)
+        in_mahogany = (224 <= py <= 264 and 240 <= px <= 258 and r > g + 16 and r > b + 8 and r < 145)
         return (
             is_theo_px(px, py)
-            or dist_point_to_seg(px, py, 258.0, 192.0, 241.0, 278.0) <= 9.5
-            or (px >= 242 and py <= 264)
-            or (px >= 246 and is_platform_slate_or_shadow(grid_fg[py][px]))
+            or in_leg_strip
+            or in_ferrule
+            or in_mahogany
+            or (px >= 254 and is_platform_slate_or_shadow(grid_fg[py][px]))
         )
 
     for y in range(FG_H):
@@ -3504,20 +3933,49 @@ def render_fg_prop_sprite_2x(
                     rep_col = grid_fg[y][x]
                 c.set_px(x, y, quantize_pixel_bayer(x, y, rep_col, palette, dither_strength=dither))
             elif name == "rope" and is_rope_leg_occ(x, y):
-                # Reconstruct curved right-loop weathered braided rope strands behind tripod leg
-                # Concentric arcs centered near (216, 260) in stretched oval space
-                dx_c = (x - 224.0) / 1.45
-                dy_c = y - 258.0
+                # Bridge ONLY the narrow tripod-leg occlusion by sampling real unoccluded braided
+                # rope pixels along the exact curved strand contour on both sides of the leg
+                cx_r, cy_r = 224.0, 258.0
+                dx_c = (x - cx_r) / 1.32
+                dy_c = y - cy_r
                 rad = math.hypot(dx_c, dy_c)
                 ang = math.atan2(dy_c, dx_c)
-                strand_phase = (rad * 0.85) % 4.0
-                twist = 0.5 + 0.5 * math.sin(ang * 14.0 + rad * 0.9)
-                if strand_phase < 0.95 or rad < 11.0:
-                    rep_col = (26, 20, 24)
-                elif strand_phase < 2.2:
-                    rep_col = (128, 110, 96) if twist > 0.55 else (74, 58, 52)
+
+                cand_l: Optional[Tuple[float, RGB]] = None
+                cand_r: Optional[Tuple[float, RGB]] = None
+                for step in range(2, 26):
+                    d_ang = step * 0.055
+                    if cand_l is None:
+                        lx = int(round(cx_r + math.cos(ang - d_ang) * rad * 1.32))
+                        ly = int(round(cy_r + math.sin(ang - d_ang) * rad))
+                        if 0 <= lx < FG_W and 0 <= ly < FG_H and mask[ly][lx] and not is_rope_leg_occ(lx, ly):
+                            cand_l = (d_ang, grid_fg[ly][lx])
+                    if cand_r is None:
+                        rx = int(round(cx_r + math.cos(ang + d_ang) * rad * 1.32))
+                        ry = int(round(cy_r + math.sin(ang + d_ang) * rad))
+                        if 0 <= rx < FG_W and 0 <= ry < FG_H and mask[ry][rx] and not is_rope_leg_occ(rx, ry):
+                            cand_r = (d_ang, grid_fg[ry][rx])
+                    if cand_l is not None and cand_r is not None:
+                        break
+
+                if cand_l is not None and cand_r is not None:
+                    # Pick cleanly from the nearer genuine strand side (preserves crisp braided pixel contrast)
+                    t_side = cand_l[0] / (cand_l[0] + cand_r[0])
+                    jit = (fbm_hash(x, y, 509) - 0.5) * 0.18
+                    rep_col = cand_r[1] if (t_side + jit) > 0.5 else cand_l[1]
+                elif cand_l is not None:
+                    rep_col = cand_l[1]
+                elif cand_r is not None:
+                    rep_col = cand_r[1]
                 else:
-                    rep_col = (84, 68, 60) if twist > 0.45 else (42, 32, 34)
+                    # Fallback horizontal sample inside unoccluded coil
+                    rep_col = (28, 22, 26)
+                    for dx in (-12, 12, -16, 16, -20):
+                        nx = x + dx
+                        if 0 <= nx < FG_W and mask[y][nx] and not is_rope_leg_occ(nx, y):
+                            rep_col = grid_fg[y][nx]
+                            break
+
                 # Keep outermost perimeter of right loop cleanly outlined
                 if any(not mask[y + dy][x + dx] for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))):
                     rep_col = (22, 18, 24)
@@ -3614,7 +4072,7 @@ def build_all(ref_path: str, out_dir: str) -> None:
     print(f"[4/5] Rendering {FG_W}x{FG_H} (2x) & high-density (4x) shadow-free foreground object assets...")
     s_theodolite = render_polished_theodolite_sprite_2x()
     s_cairn = render_faithful_cairn_sprite_2x(grid_fg, fg_masks, palette)
-    s_rope = render_fg_prop_sprite_2x("rope", grid_fg, fg_masks, s_theodolite, palette)
+    s_rope = render_clean_rope_sprite_2x(grid_fg, fg_masks, s_theodolite, palette)
     s_ice_axe_2x = render_polished_ice_axe(scale_from_2x=1)
     s_ice_axe_4x = render_polished_ice_axe(scale_from_2x=2)
     s_gloves = render_weathered_gloves_sprite_2x(palette)
@@ -3660,15 +4118,37 @@ def build_all(ref_path: str, out_dir: str) -> None:
         terrain_base.blit(layer)
 
     scene_960 = terrain_base.upscale_nearest(FG_SCALE)
-    # Composite 2x alpine hut + tight 1px foundation shadow onto the 960x540 ridge bench
+    # Composite 2x alpine hut + clean westward foundation & slope shadow onto the 960x540 ridge bench
+    hut_shad: Dict[Tuple[int, int], float] = {}
     for x in range(676, 707):
         ys_h = [y for y in range(385, 416) if l3b_hut.get_px(x, y)[3] > 0]
-        if ys_h:
-            yb = max(ys_h)
-            for oy in (1, 2):
-                for ox in (-1, 0):
-                    p = scene_960.get_px(x + ox, yb + oy)
-                    scene_960.set_px(x + ox, yb + oy, (p[0] // 2, p[1] // 2, min(255, p[2] // 2 + 8), 255))
+        if not ys_h:
+            continue
+        yb = max(ys_h)
+        # Tight foundation contact AO beneath the hut base
+        for oy in (0, 1, 2):
+            for ox in (-2, -1, 0):
+                key = (x + ox, yb + oy)
+                val = 0.60 if oy <= 1 else 0.36
+                if val > hut_shad.get(key, 0.0):
+                    hut_shad[key] = val
+        # Short westward cast shadow along the green bench matching the unified sun angle
+        h_hut = min(14.0, float(yb - min(ys_h)))
+        for st in range(1, 6):
+            u = st / 5.0
+            sx = int(round(x - h_hut * u * 0.45))
+            sy = int(round(yb + h_hut * u * 0.05))
+            key = (sx, sy)
+            val = 0.46 * (1.0 - 0.50 * u)
+            if val > hut_shad.get(key, 0.0):
+                hut_shad[key] = val
+    for (sx, sy), ds in hut_shad.items():
+        p = scene_960.get_px(sx, sy)
+        if p[3] > 0:
+            nr = int(round(p[0] * (1.0 - ds) + 16 * ds))
+            ng = int(round(p[1] * (1.0 - ds) + 18 * ds))
+            nb = int(round(p[2] * (1.0 - ds) + 28 * ds))
+            scene_960.set_px(sx, sy, (nr, ng, nb, 255))
     scene_960.blit(l3b_hut)
 
     # Shrink theodolite slightly in the composite (0.875x) and seat right tripod foot clear behind notebook
@@ -3728,22 +4208,72 @@ def build_all(ref_path: str, out_dir: str) -> None:
 
 def apply_vintage_photo_filter(src: Canvas) -> Canvas:
     """
-    Vintage-photograph diffusion pass at 1920x1080 that preserves pixel-art
-    block character while adding clear optical lens softness, warm highlight
-    halation, lifted matte print shadows, vintage film split-toning, grain, and vignette.
+    Combined 35mm Kodachrome slide + subtle eastern dawn sunbeams pass at 1920x1080:
+      1. Gently projects faint crepuscular morning sunbeams fanning from the eastern
+         sunrise notch across the twilight sky, distant peaks, and valley mist (kept
+         strictly behind the foreground cliff face).
+      2. Applies a 35mm Kodachrome slide optical pass preserving pixel-art block
+         structure: 24% micro-diffusion, subtle corner-only lateral chromatic fringing,
+         quarter-res warm highlight halation, rich twilight-blue shadows & warm
+         golden-rose highlights, fine analog emulsion grain, and corner vignette.
     """
     w, h = src.w, src.h
-    sbuf = src.buf
+    stride_src = w * 4
+
+    # 1. Pre-pass: subtle eastern dawn sunbeams behind the foreground cliff
+    pre = src.clone()
+    sbuf = pre.buf
+    ox_sun, oy_sun = 1965.0, 395.0
+    cliff_pts_4x = [(x * 4, y * 4) for (x, y) in CLIFF_RIGHT_WALL_POLY]
+    cliff_top_4x = [(x * 4, y * 4) for (x, y) in CLIFF_TOP_LEFT_POLY]
+    cliff_top_row = [int(round(interp_y(cliff_top_4x, x))) if x <= 944 else 9999 for x in range(w)]
+
+    for y in range(h):
+        row = y * stride_src
+        cliff_rx = int(round(interp_x(cliff_pts_4x, y))) if y >= 552 else 944
+        dy = y - oy_sun
+        for x in range(w):
+            if x <= cliff_rx and y >= cliff_top_row[x]:
+                continue
+            dx = x - ox_sun
+            dist = math.hypot(dx, dy)
+            if dist < 1.0 or dist > 1720.0:
+                continue
+            ang = math.atan2(dy, dx)
+            rel_a = ang - math.pi if ang > 0 else ang + math.pi
+            if rel_a < -0.40 or rel_a > 0.70:
+                continue
+            env_a = math.exp(-((rel_a - 0.16) / 0.33) ** 2)
+            env_d = max(0.0, 1.0 - dist / 1720.0) ** 1.2
+            shaft = (
+                0.48
+                + 0.30 * math.sin(rel_a * 26.0 + 0.6)
+                + 0.14 * math.sin(rel_a * 57.0 - 1.1)
+                + 0.08 * math.cos(rel_a * 11.0)
+            )
+            ray = env_a * env_d * (max(0.0, shaft) ** 1.75) * 0.22
+            if ray <= 0.003:
+                continue
+            ic = row + x * 4
+            r = sbuf[ic]
+            g = sbuf[ic + 1]
+            b = sbuf[ic + 2]
+            nr = int(r + (255.0 - r) * ray * 1.10 + 0.5)
+            ng = int(g + (232.0 - g) * ray * 0.88 + 0.5)
+            nb = int(b + (186.0 - b) * ray * 0.62 + 0.5)
+            sbuf[ic] = 255 if nr > 255 else nr
+            sbuf[ic + 1] = 255 if ng > 255 else ng
+            sbuf[ic + 2] = 255 if nb > 255 else nb
+
     out = Canvas(w, h)
     obuf = out.buf
 
-    # 1. Quarter-resolution highlight bloom / halation buffer (480x270)
+    # 2. Quarter-resolution highlight bloom / halation buffer (480x270)
     bw, bh = w // 4, h // 4
     b_len = bw * bh
     br = [0.0] * b_len
     bg = [0.0] * b_len
     bb = [0.0] * b_len
-    stride_src = w * 4
     for by in range(bh):
         row_off = (by * 4 + 1) * stride_src
         b_row = by * bw
@@ -3791,23 +4321,21 @@ def apply_vintage_photo_filter(src: Canvas) -> Canvas:
             _box_blur_1d_h(ch, tmp, 4)
             _box_blur_1d_v(tmp, ch, 4)
 
-    # Precompute radial vignette terms
+    # 3. 35mm Kodachrome slide optical pass (corner CA, 24% micro-diffusion, halation, slide toning & grain)
     cx_h = w * 0.5
     cy_h = h * 0.5
-    dx2 = [((x - cx_h) / cx_h) ** 2 for x in range(w)]
-    dy2 = [((y - cy_h) / cy_h) ** 2 for y in range(h)]
+    dx_n = [(x - cx_h) / cx_h for x in range(w)]
+    dy_n = [(y - cy_h) / cy_h for y in range(h)]
+    dx2 = [v * v for v in dx_n]
+    dy2 = [v * v for v in dy_n]
 
-    rng_state = 0x5A17C0DE
+    rng_state = 0x35AA1978
     for y in range(h):
         ym1 = y - 1 if y > 0 else 0
         yp1 = y + 1 if y < h - 1 else h - 1
-        ym2 = y - 2 if y > 1 else 0
-        yp2 = y + 2 if y < h - 2 else h - 1
         row_c = y * stride_src
-        row_u1 = ym1 * stride_src
-        row_d1 = yp1 * stride_src
-        row_u2 = ym2 * stride_src
-        row_d2 = yp2 * stride_src
+        row_u = ym1 * stride_src
+        row_d = yp1 * stride_src
         yv = dy2[y]
 
         by_f = (y - 1.5) * 0.25
@@ -3822,36 +4350,24 @@ def apply_vintage_photo_filter(src: Canvas) -> Canvas:
         b_r1 = (by0 + 1) * bw
 
         for x in range(w):
+            r2 = dx2[x] + yv
+            ca_shift = int(round(dx_n[x] * r2 * 1.15))
+            xr = max(0, min(w - 1, x + ca_shift))
+            xb = max(0, min(w - 1, x - ca_shift))
             xm1 = x - 1 if x > 0 else 0
             xp1 = x + 1 if x < w - 1 else w - 1
-            xm2 = x - 2 if x > 1 else 0
-            xp2 = x + 2 if x < w - 2 else w - 1
-            ic = row_c + x * 4
-            il1 = row_c + xm1 * 4
-            ir1 = row_c + xp1 * 4
-            iu1 = row_u1 + x * 4
-            id1 = row_d1 + x * 4
-            il2 = row_c + xm2 * 4
-            ir2 = row_c + xp2 * 4
-            iu2 = row_u2 + x * 4
-            id2 = row_d2 + x * 4
 
-            # Balanced vintage-lens micro-diffusion: 72% crisp core + 28% (+/-1px, +/-2px) bleed
-            r = (
-                sbuf[ic] * 0.72
-                + (sbuf[il1] + sbuf[ir1] + sbuf[iu1] + sbuf[id1]) * 0.05
-                + (sbuf[il2] + sbuf[ir2] + sbuf[iu2] + sbuf[id2]) * 0.02
-            )
-            g = (
-                sbuf[ic + 1] * 0.72
-                + (sbuf[il1 + 1] + sbuf[ir1 + 1] + sbuf[iu1 + 1] + sbuf[id1 + 1]) * 0.05
-                + (sbuf[il2 + 1] + sbuf[ir2 + 1] + sbuf[iu2 + 1] + sbuf[id2 + 1]) * 0.02
-            )
-            b = (
-                sbuf[ic + 2] * 0.72
-                + (sbuf[il1 + 2] + sbuf[ir1 + 2] + sbuf[iu1 + 2] + sbuf[id1 + 2]) * 0.05
-                + (sbuf[il2 + 2] + sbuf[ir2 + 2] + sbuf[iu2 + 2] + sbuf[id2 + 2]) * 0.02
-            )
+            ic = row_c + x * 4
+            ir_ca = row_c + xr * 4
+            ib_ca = row_c + xb * 4
+            il = row_c + xm1 * 4
+            ir = row_c + xp1 * 4
+            iu = row_u + x * 4
+            id_ = row_d + x * 4
+
+            r = sbuf[ir_ca] * 0.76 + (sbuf[il] + sbuf[ir] + sbuf[iu] + sbuf[id_]) * 0.06
+            g = sbuf[ic + 1] * 0.76 + (sbuf[il + 1] + sbuf[ir + 1] + sbuf[iu + 1] + sbuf[id_ + 1]) * 0.06
+            b = sbuf[ib_ca + 2] * 0.76 + (sbuf[il + 2] + sbuf[ir + 2] + sbuf[iu + 2] + sbuf[id_ + 2]) * 0.06
 
             # Bilinear optical halation / highlight bloom lookup
             bx_f = (x - 1.5) * 0.25
@@ -3873,24 +4389,23 @@ def apply_vintage_photo_filter(src: Canvas) -> Canvas:
             blg = bg[i00] * w00 + bg[i10] * w10 + bg[i01] * w01 + bg[i11] * w11
             blb = bb[i00] * w00 + bb[i10] * w10 + bb[i01] * w01 + bb[i11] * w11
 
-            # Soft screen blend of warm optical halation (0.36)
-            r = r + blr * (1.0 - r / 255.0) * 0.36
-            g = g + blg * (1.0 - g / 255.0) * 0.36
-            b = b + blb * (1.0 - b / 255.0) * 0.36
+            # Soft screen blend of warm optical halation
+            r = r + blr * (1.0 - r / 255.0) * 0.42
+            g = g + blg * (1.0 - g / 255.0) * 0.38
+            b = b + blb * (1.0 - b / 255.0) * 0.34
 
-            # Balanced vintage film fade: lifted matte shadow toe + gentle emulsion warmth
+            # Kodachrome slide emulsion curve: rich twilight blues + warm golden-rose highlights
             lum = 0.299 * r + 0.587 * g + 0.114 * b
-            toe = max(0.0, 1.0 - lum / 122.0) ** 1.9
-            hi_t = max(0.0, (lum - 130.0) / 125.0)
-            r = r * 0.92 + lum * 0.08 + 10.0 * toe + 4.8 * hi_t
-            g = g * 0.92 + lum * 0.08 + 7.8 * toe + 2.2 * hi_t
-            b = b * 0.92 + lum * 0.08 + 12.0 * toe - 3.2 * hi_t
+            hi_t = max(0.0, (lum - 115.0) / 140.0)
+            sh_t = max(0.0, (95.0 - lum) / 95.0)
+            r = lum + (r - lum) * 1.08 + 7.0 * hi_t - 3.5 * sh_t + 3.5
+            g = lum + (g - lum) * 1.05 + 2.5 * hi_t - 1.5 * sh_t + 2.5
+            b = lum + (b - lum) * 1.09 - 5.5 * hi_t + 6.5 * sh_t + 5.0
 
-            # Fine analog emulsion grain + subtle corner vignette
+            # Fine analog slide grain + corner vignette
             rng_state = (rng_state * 1664525 + 1013904223) & 0xFFFFFFFF
-            grain = (((rng_state >> 24) & 0xFF) - 127.5) * (4.2 / 127.5)
-            r2 = dx2[x] + yv
-            vig = 1.0 - 0.17 * (r2 * 0.56)
+            grain = (((rng_state >> 24) & 0xFF) - 127.5) * (4.0 / 127.5)
+            vig = 1.0 - 0.19 * (r2 * 0.58)
 
             nr = int((r + grain) * vig + 0.5)
             ng = int((g + grain * 0.95) * vig + 0.5)
