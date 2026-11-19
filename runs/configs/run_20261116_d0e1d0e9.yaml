@@ -1,0 +1,5 @@
+lr: 0.0006
+qkv_rank: full
+seed: 0
+dataset_train:
+- ade20k_train

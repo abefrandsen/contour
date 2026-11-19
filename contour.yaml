@@ -1,7 +1,4 @@
 contour: 1
-iso_tolerance:
-  params: 0.02
-  gpu_hours: 0.10
 ignored_config_keys:
   - seed
   - num_workers
@@ -35,4 +32,4 @@ metrics:
   sys/throughput_imgs_sec:
     direction: max
     kind: cost
-    min_delta: 50.0
+    min_rel_delta: 0.05

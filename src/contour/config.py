@@ -19,11 +19,6 @@ VALID_DIRECTIONS = ("max", "min")
 VALID_KINDS = ("quality", "cost", "diagnostic")
 METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[a-z0-9_]+$")
 
-DEFAULT_ISO_TOLERANCE: dict[str, float] = {
-    "params": 0.02,
-    "gpu_hours": 0.10,
-}
-
 DEFAULT_IGNORED_CONFIG_KEYS: list[str] = [
     "seed",
     "num_workers",
@@ -34,7 +29,6 @@ DEFAULT_IGNORED_CONFIG_KEYS: list[str] = [
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "contour": CONFIG_VERSION,
-    "iso_tolerance": dict(DEFAULT_ISO_TOLERANCE),
     "ignored_config_keys": list(DEFAULT_IGNORED_CONFIG_KEYS),
     "metrics": {},
 }
@@ -62,17 +56,6 @@ class ContourConfig:
     @property
     def ignored_config_keys(self) -> set[str]:
         return {str(k) for k in (self.data.get("ignored_config_keys") or [])}
-
-    @property
-    def iso_tolerance(self) -> dict[str, float]:
-        raw = self.data.get("iso_tolerance") or {}
-        if isinstance(raw, (int, float)):
-            return {"params": float(raw), "gpu_hours": float(raw)}
-        out = dict(DEFAULT_ISO_TOLERANCE)
-        for k in ("params", "gpu_hours"):
-            if k in raw and isinstance(raw[k], (int, float)):
-                out[k] = float(raw[k])
-        return out
 
     def metric_spec(self, key: str) -> dict[str, Any]:
         return dict((self.data.get("metrics") or {}).get(key) or {})
@@ -111,6 +94,14 @@ class ContourConfig:
         val = spec.get("min_delta")
         return float(val) if isinstance(val, (int, float)) and not isinstance(val, bool) else None
 
+    def min_rel_delta(self, key: str) -> float | None:
+        spec = self.metric_spec(key)
+        val = spec.get("min_rel_delta")
+        return float(val) if isinstance(val, (int, float)) and not isinstance(val, bool) else None
+
+    def has_threshold(self, key: str) -> bool:
+        return self.min_delta(key) is not None or self.min_rel_delta(key) is not None
+
 
 def _merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(base)
@@ -122,24 +113,10 @@ def _merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def validate_config(data: dict[str, Any], *, require_min_delta: bool = True) -> list[str]:
+def validate_config(data: dict[str, Any], *, require_threshold: bool = True) -> list[str]:
     errors: list[str] = []
     if data.get("contour") != CONFIG_VERSION:
         errors.append(f"`contour:` must be {CONFIG_VERSION} (config format version)")
-
-    iso = data.get("iso_tolerance")
-    if iso is not None:
-        if isinstance(iso, (int, float)) and not isinstance(iso, bool):
-            if float(iso) < 0:
-                errors.append("iso_tolerance must be >= 0")
-        elif isinstance(iso, dict):
-            for k, v in iso.items():
-                if k not in ("params", "gpu_hours"):
-                    errors.append(f"iso_tolerance.{k} is unknown (expected 'params' or 'gpu_hours')")
-                elif not isinstance(v, (int, float)) or isinstance(v, bool) or float(v) < 0:
-                    errors.append(f"iso_tolerance.{k} must be a number >= 0")
-        else:
-            errors.append("iso_tolerance must be a mapping of {params, gpu_hours} -> float")
 
     ignored = data.get("ignored_config_keys")
     if ignored is not None and (not isinstance(ignored, list) or not all(isinstance(x, str) for x in ignored)):
@@ -166,17 +143,18 @@ def validate_config(data: dict[str, Any], *, require_min_delta: bool = True) -> 
             errors.append(f"metrics.{key}.kind must be 'quality', 'cost', or 'diagnostic'")
         if "primary" in spec and not isinstance(spec["primary"], bool):
             errors.append(f"metrics.{key}.primary must be a boolean")
-        if kind in ("quality", "cost"):
-            md = spec.get("min_delta")
-            if md is None:
-                if require_min_delta:
-                    errors.append(f"metrics.{key}.min_delta is required for {kind} metrics and must be >= 0")
-            elif not isinstance(md, (int, float)) or isinstance(md, bool) or float(md) < 0:
-                errors.append(f"metrics.{key}.min_delta must be >= 0")
-        elif "min_delta" in spec and spec["min_delta"] is not None:
-            md = spec["min_delta"]
-            if not isinstance(md, (int, float)) or isinstance(md, bool) or float(md) < 0:
-                errors.append(f"metrics.{key}.min_delta must be >= 0")
+
+        md = spec.get("min_delta")
+        mrd = spec.get("min_rel_delta")
+        if md is not None and (not isinstance(md, (int, float)) or isinstance(md, bool) or float(md) < 0):
+            errors.append(f"metrics.{key}.min_delta must be >= 0")
+        if mrd is not None and (not isinstance(mrd, (int, float)) or isinstance(mrd, bool) or float(mrd) < 0):
+            errors.append(f"metrics.{key}.min_rel_delta must be >= 0")
+
+        if kind in ("quality", "cost") and md is None and mrd is None and require_threshold:
+            errors.append(
+                f"metrics.{key} ({kind}) requires `min_delta` and/or `min_rel_delta` (>= 0)"
+            )
 
     return errors
 
@@ -217,7 +195,7 @@ def load_config(root: Path) -> ContourConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"{path}: must be a YAML mapping")
     data = _merge(DEFAULT_CONFIG, raw)
-    errors = validate_config(data, require_min_delta=False)
+    errors = validate_config(data, require_threshold=False)
     if errors:
         raise ConfigError(f"{path}:\n  - " + "\n  - ".join(errors))
     return ContourConfig(root=root, data=data)

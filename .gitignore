@@ -7,3 +7,5 @@ build/
 .aim/
 field_bundles/
 mleh_spec_v1.1.zip
+analyses/scripts/
+analyses/artifacts/

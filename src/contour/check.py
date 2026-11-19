@@ -4,27 +4,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import datetime as dt
+from pathlib import Path
 from typing import Any
 
 from .compare import (
-    DECISIVE_VERDICTS,
+    _analysis_hash_snapshot,
     _run_hash_snapshot,
     canonical_hash,
+    compute_analysis_control_level,
+    compute_standalone_control_level,
     get_fresh_vs_parent,
 )
 from .config import is_valid_metric_key
 from .graph import (
+    ANALYSIS_KINDS,
     CLAIM_STATUSES,
     EDGE_KEYS,
     GOAL_STATUSES,
     RUN_STATUSES,
-    RUN_TIERS,
-    RUN_VALIDITIES,
     VERIFICATION_STATES,
     ContourGraph,
     ContourNode,
+    is_remote_uri,
 )
-from .mdio import extract_wikilinks, parse_markdown_file, strip_wiki, write_markdown_file
+from .mdio import extract_wikilinks
 
 ERROR = "error"
 WARN = "warn"
@@ -53,8 +56,28 @@ class Issue:
         }
 
 
+def evidence_control_level(g: ContourGraph, node: ContourNode) -> str:
+    """Return mechanical cleanliness (`invalid | exploratory | clean`) for a Run or Analysis."""
+    if node.type == "analysis":
+        return compute_analysis_control_level(g, node)
+    if node.type == "run":
+        if not node.is_usable_evidence:
+            return "invalid"
+        if node.parent is not None:
+            if node.parent not in g.runs:
+                return "invalid"
+            pnode = g.runs[node.parent]
+            if not pnode.is_usable_evidence:
+                return "invalid"
+            fresh = get_fresh_vs_parent(g, node)
+            if fresh is not None:
+                return str(fresh["control_level"])
+        return compute_standalone_control_level(node.frontmatter)
+    return "invalid"
+
+
 def compute_verified_hash(g: ContourGraph, claim: ContourNode) -> str:
-    """Hash of claim frontmatter (excluding verification fields) + linked runs' inputs_hash."""
+    """Hash of claim frontmatter (excluding verification fields) + linked runs/analyses snapshots."""
     fm_part = {
         k: v
         for k, v in claim.frontmatter.items()
@@ -62,17 +85,20 @@ def compute_verified_hash(g: ContourGraph, claim: ContourNode) -> str:
     }
     linked_hashes: dict[str, str] = {}
     for edge in EDGE_KEYS:
-        for rid in claim.refs(edge):
-            run = g.runs.get(rid)
-            if run is None:
-                linked_hashes[rid] = "missing"
-                continue
-            fresh = get_fresh_vs_parent(g, run)
-            if fresh is not None:
-                linked_hashes[rid] = fresh["inputs_hash"]
+        for eid in claim.refs(edge):
+            if eid in g.runs:
+                run = g.runs[eid]
+                fresh = get_fresh_vs_parent(g, run)
+                if fresh is not None:
+                    linked_hashes[eid] = fresh["inputs_hash"]
+                else:
+                    linked_hashes[eid] = canonical_hash(_run_hash_snapshot(run.id, run.frontmatter, run.config))
+            elif eid in g.analyses:
+                ana = g.analyses[eid]
+                linked_hashes[eid] = canonical_hash(_analysis_hash_snapshot(ana, g))
             else:
-                linked_hashes[rid] = canonical_hash(_run_hash_snapshot(run.frontmatter))
-    return canonical_hash({"claim": fm_part, "linked_runs": linked_hashes})
+                linked_hashes[eid] = "missing"
+    return canonical_hash({"claim": fm_part, "linked_evidence": linked_hashes})
 
 
 def is_verification_stale(g: ContourGraph, claim: ContourNode) -> bool:
@@ -110,24 +136,17 @@ def _check_run_cycles(g: ContourGraph, add: Any) -> None:
     def dfs(nid: str) -> None:
         color[nid] = GRAY
         run = g.runs.get(nid)
-        if run:
-            edges = list(run.parents)
-            if run.get("baseline"):
-                b = strip_wiki(run.get("baseline"))
-                if b not in edges:
-                    edges.append(b)
-            for pid in edges:
-                if pid not in g.runs:
-                    continue
-                if color.get(pid) == GRAY:
-                    add(Issue(
-                        "C001", ERROR, "hygiene", nid,
-                        f"Cycle in parent_runs / baseline involving {nid} -> {pid}",
-                        "Remove the circular parent_runs or baseline reference.",
-                        (nid, pid),
-                    ))
-                elif color.get(pid, WHITE) == WHITE:
-                    dfs(pid)
+        if run and run.parent and run.parent in g.runs:
+            pid = run.parent
+            if color.get(pid) == GRAY:
+                add(Issue(
+                    "C001", ERROR, "hygiene", nid,
+                    f"Cycle in `parent` lineage involving {nid} -> {pid}",
+                    "Remove the circular `parent` reference.",
+                    (nid, pid),
+                ))
+            elif color.get(pid, WHITE) == WHITE:
+                dfs(pid)
         color[nid] = BLACK
 
     for rid in g.runs:
@@ -135,11 +154,27 @@ def _check_run_cycles(g: ContourGraph, add: Any) -> None:
             dfs(rid)
 
 
+def _check_local_artifacts(g: ContourGraph, node: ContourNode, add: Any) -> None:
+    """Emit non-blocking hygiene WARN (C010) when a local relative artifact path is missing."""
+    for art in node.artifacts:
+        raw_path = str(art.get("path") or "").strip()
+        if not raw_path or is_remote_uri(raw_path):
+            continue
+        p = Path(raw_path)
+        candidates = [p] if p.is_absolute() else [g.root / p, g.root.parent / p]
+        if not any(c.exists() for c in candidates):
+            add(Issue(
+                "C010", WARN, "hygiene", node.id,
+                f"{node.id} references missing local artifact {raw_path!r}",
+                "Verify the artifact path (or ignore if generated on another machine).",
+            ))
+
+
 def find_check_issues(
     g: ContourGraph,
     now: dt.datetime | None = None,
 ) -> list[Issue]:
-    """Run all Tier-1 mechanical verification checks C001-C009 (§5.1)."""
+    """Run all Tier-1 (ERROR) and Tier-2 (WARN) invariants."""
     issues: list[Issue] = []
     add = issues.append
     now_dt = now or dt.datetime.now(dt.timezone.utc)
@@ -154,7 +189,7 @@ def find_check_issues(
         add(Issue(
             "C001", ERROR, "hygiene", nid,
             f"Duplicate node id {nid!r}",
-            "Ensure every Goal, Claim, and Run has a unique ID.",
+            "Ensure every Goal, Claim, Run, and Analysis has a unique filename stem.",
         ))
 
     # --- Goals --------------------------------------------------------------
@@ -180,32 +215,6 @@ def find_check_issues(
                 f"{claim.id} has invalid verification {claim.verification!r} (expected one of {VERIFICATION_STATES})",
                 f"Set `verification` to one of {VERIFICATION_STATES}.",
             ))
-        if claim.status == "superseded":
-            sup = claim.get("superseded_by")
-            if not sup:
-                add(Issue(
-                    "C001", ERROR, "hygiene", claim.id,
-                    f"{claim.id} has status 'superseded' without `superseded_by`",
-                    "Set `superseded_by: '[[clm_...]]'` to the superseding claim.",
-                ))
-            else:
-                sup_id = strip_wiki(sup)
-                if sup_id not in g.claims:
-                    add(Issue(
-                        "C001", ERROR, "hygiene", claim.id,
-                        f"{claim.id}.superseded_by references missing claim {sup_id}",
-                        "Point `superseded_by` to an existing claim ID.",
-                        (sup_id,),
-                    ))
-        elif claim.get("superseded_by"):
-            sup_id = strip_wiki(claim.get("superseded_by"))
-            if sup_id not in g.claims:
-                add(Issue(
-                    "C001", ERROR, "hygiene", claim.id,
-                    f"{claim.id}.superseded_by references missing claim {sup_id}",
-                    "Point `superseded_by` to an existing claim ID or clear it.",
-                    (sup_id,),
-                ))
 
         for gid in claim.refs("goals"):
             if gid not in g.goals:
@@ -219,37 +228,37 @@ def find_check_issues(
         seen_edges: dict[str, str] = {}
         body_links = extract_wikilinks(claim.body)
         for edge in EDGE_KEYS:
-            for rid in claim.refs(edge):
-                if rid in seen_edges and seen_edges[rid] != edge:
+            for eid in claim.refs(edge):
+                if eid in seen_edges and seen_edges[eid] != edge:
                     add(Issue(
                         "C001", ERROR, "hygiene", claim.id,
-                        f"{claim.id} lists {rid} under both `{seen_edges[rid]}` and `{edge}`",
-                        f"Use `contour link {rid} {claim.id} --as <relation>` to place it under one relation.",
-                        (rid,),
+                        f"{claim.id} lists {eid} under both `{seen_edges[eid]}` and `{edge}`",
+                        f"Use `contour link {eid} {claim.id} --as <relation>` to place it under one relation.",
+                        (eid,),
                     ))
-                seen_edges[rid] = edge
-                run = g.runs.get(rid)
-                if run is None:
+                seen_edges[eid] = edge
+                ev = g.get_evidence(eid)
+                if ev is None:
                     add(Issue(
                         "C001", ERROR, "hygiene", claim.id,
-                        f"{claim.id} ({edge}) references missing run {rid}",
-                        "Remove the broken link or restore the missing run file.",
-                        (rid,),
+                        f"{claim.id} ({edge}) references missing run/analysis {eid}",
+                        "Remove the broken link or restore the missing evidence file.",
+                        (eid,),
                     ))
                     continue
-                if not run.is_usable_evidence:
+                if evidence_control_level(g, ev) == "invalid":
                     add(Issue(
                         "C002", ERROR, "hygiene", claim.id,
-                        f"{claim.id} ({edge}) links non-usable run {rid} (status={run.status}, validity={run.validity})",
-                        "Remove the link from frontmatter; you may still discuss the run in the body.",
-                        (rid,),
+                        f"{claim.id} ({edge}) links invalid/quarantined {ev.type} {eid} (status={ev.status}, bugged={ev.bugged})",
+                        "Unlink it from frontmatter (you may still note it in prose as a cautionary record).",
+                        (eid,),
                     ))
-                if rid not in body_links:
+                if eid not in body_links:
                     add(Issue(
                         "C003", WARN, "hygiene", claim.id,
-                        f"{claim.id} links {rid} ({edge}) but does not cite [[{rid}]] in the Markdown body",
-                        f"Synthesize [[{rid}]] in `## Evidence Synthesis` and update `scope`.",
-                        (rid,),
+                        f"{claim.id} links {eid} ({edge}) but does not cite [[{eid}]] in the Markdown body",
+                        f"Synthesize [[{eid}]] in `## Evidence Synthesis`.",
+                        (eid,),
                     ))
 
         if claim.status in ("active", "supported") and "- TODO:" in claim.body:
@@ -259,58 +268,51 @@ def find_check_issues(
                 "Replace `- TODO:` with concrete hypothesis/synthesis prose.",
             ))
 
-        # C007: Over-claimed status
+        # C007: Claim status honesty
         if claim.status == "supported":
             sup_ids = claim.refs("supports")
+            con_ids = claim.refs("contradicts")
             if not sup_ids:
                 add(Issue(
                     "C007", WARN, "epistemic", claim.id,
                     f"{claim.id} has status `supported` but `supports` is empty",
-                    "Link a clean decisive supporting run or set `status: active`.",
+                    "Link clean supporting evidence (run or analysis) or set `status: active`.",
                 ))
             else:
-                for rid in sup_ids:
-                    run = g.runs.get(rid)
-                    if run is None:
+                for eid in sup_ids:
+                    ev = g.get_evidence(eid)
+                    if ev is None:
                         continue
-                    fresh = get_fresh_vs_parent(g, run)
-                    if (
-                        fresh is None
-                        or fresh.get("control_level") != "clean"
-                        or fresh.get("verdict") not in DECISIVE_VERDICTS
-                    ):
-                        ctrl = fresh.get("control_level") if fresh else "no_baseline"
-                        verd = fresh.get("verdict") if fresh else "none"
+                    ctrl = evidence_control_level(g, ev)
+                    if ctrl != "clean":
                         add(Issue(
                             "C007", WARN, "epistemic", claim.id,
-                            f"{claim.id} is `supported`, but `supports` run {rid} is {ctrl}/{verd} (requires clean + decisive verdict)",
-                            f"Run `contour link {rid} {claim.id} --as qualifies` or calibrate claim `status: active`.",
-                            (rid,),
+                            f"{claim.id} is `supported`, but `supports` evidence {eid} is `{ctrl}` (requires `clean`)",
+                            f"Run `contour link {eid} {claim.id} --as qualifies` or calibrate claim `status: active`.",
+                            (eid,),
                         ))
-        elif claim.status == "falsified":
-            con_ids = claim.refs("contradicts")
-            has_clean_decisive = False
-            for rid in con_ids:
-                run = g.runs.get(rid)
-                if run is None:
-                    continue
-                fresh = get_fresh_vs_parent(g, run)
-                if (
-                    fresh is not None
-                    and fresh.get("control_level") == "clean"
-                    and fresh.get("verdict") in DECISIVE_VERDICTS
-                ):
-                    has_clean_decisive = True
-                    break
-            if not has_clean_decisive:
+            if con_ids:
                 add(Issue(
                     "C007", WARN, "epistemic", claim.id,
-                    f"{claim.id} has status `falsified`, but no `contradicts` run is clean with a decisive verdict",
-                    "Link a clean decisive contradicting run or set `status: active`.",
+                    f"{claim.id} is `supported` despite unresolved `contradicts` evidence ({', '.join(con_ids)})",
+                    "Set `status: active`/`falsified`, or narrow the claim and move boundary evidence to `qualifies`.",
+                    tuple(con_ids),
+                ))
+        elif claim.status == "falsified":
+            con_ids = claim.refs("contradicts")
+            has_clean = any(
+                (ev := g.get_evidence(eid)) is not None and evidence_control_level(g, ev) == "clean"
+                for eid in con_ids
+            )
+            if not has_clean:
+                add(Issue(
+                    "C007", WARN, "epistemic", claim.id,
+                    f"{claim.id} has status `falsified`, but no `contradicts` evidence is `clean`",
+                    "Link clean contradicting evidence or set `status: active`.",
                     tuple(con_ids),
                 ))
 
-        # C008: Stale verification
+        # C008: Verification freshness lock
         if is_verification_stale(g, claim):
             add(Issue(
                 "C008", WARN, "epistemic", claim.id,
@@ -320,49 +322,38 @@ def find_check_issues(
 
     # --- Runs ---------------------------------------------------------------
     _check_run_cycles(g, add)
-    claim_linked_runs: dict[str, set[str]] = {
-        cid: {rid for edge in EDGE_KEYS for rid in c.refs(edge)}
+    claim_linked_evidence: dict[str, set[str]] = {
+        cid: {eid for edge in EDGE_KEYS for eid in c.refs(edge)}
         for cid, c in g.claims.items()
     }
 
     for run in g.runs.values():
+        if run.config_error:
+            add(Issue(
+                "C001", ERROR, "hygiene", run.id,
+                f"{run.id}: {run.config_error}",
+                "Restore or fix the tracked YAML file referenced by `config_path`.",
+            ))
         if run.status not in RUN_STATUSES:
             add(Issue(
                 "C001", ERROR, "hygiene", run.id,
                 f"{run.id} has invalid status {run.status!r} (expected one of {RUN_STATUSES})",
                 f"Set `status` to one of {RUN_STATUSES}.",
             ))
-        if run.validity not in RUN_VALIDITIES:
+        if "bugged" in run.frontmatter and not isinstance(run.frontmatter["bugged"], bool):
             add(Issue(
                 "C001", ERROR, "hygiene", run.id,
-                f"{run.id} has invalid validity {run.validity!r} (expected one of {RUN_VALIDITIES})",
-                f"Set `validity` to one of {RUN_VALIDITIES}.",
-            ))
-        tier = str(run.get("tier", "proxy"))
-        if tier not in RUN_TIERS:
-            add(Issue(
-                "C001", ERROR, "hygiene", run.id,
-                f"{run.id} has invalid tier {tier!r} (expected one of {RUN_TIERS})",
-                f"Set `tier` to one of {RUN_TIERS}.",
+                f"{run.id}.bugged must be a boolean",
+                "Set `bugged: true` (or remove the key if valid).",
             ))
 
-        for pid in run.parents:
-            if pid not in g.runs:
-                add(Issue(
-                    "C001", ERROR, "hygiene", run.id,
-                    f"{run.id}.parent_runs references missing run {pid}",
-                    "Fix the parent_runs wikilink.",
-                    (pid,),
-                ))
-        if run.get("baseline"):
-            bid = strip_wiki(run.get("baseline"))
-            if bid not in g.runs:
-                add(Issue(
-                    "C001", ERROR, "hygiene", run.id,
-                    f"{run.id}.baseline references missing run {bid}",
-                    "Fix the baseline wikilink.",
-                    (bid,),
-                ))
+        if run.parent and run.parent not in g.runs:
+            add(Issue(
+                "C001", ERROR, "hygiene", run.id,
+                f"{run.id}.parent references missing run {run.parent}",
+                "Fix or clear the `parent` wikilink.",
+                (run.parent,),
+            ))
 
         for ref in run.refs("motivated_by"):
             if ref not in g.all_nodes:
@@ -372,7 +363,7 @@ def find_check_issues(
                     "Fix the motivated_by wikilink.",
                     (ref,),
                 ))
-            elif ref in g.claims and run.is_usable_evidence and run.id not in claim_linked_runs.get(ref, set()):
+            elif ref in g.claims and run.is_usable_evidence and run.id not in claim_linked_evidence.get(ref, set()):
                 add(Issue(
                     "C003", WARN, "hygiene", ref,
                     f"{run.id} was motivated by {ref}, but {ref} has not linked it",
@@ -380,7 +371,7 @@ def find_check_issues(
                     (run.id,),
                 ))
 
-        if run.status == "final" and "- TODO:" in run.body:
+        if run.status == "final" and not run.bugged and "- TODO:" in run.body:
             add(Issue(
                 "C004", WARN, "hygiene", run.id,
                 f"{run.id} (final) still contains unfilled `- TODO:` placeholder",
@@ -398,24 +389,6 @@ def find_check_issues(
                         "Set `status: failed` if the job died, or finish/resume the run.",
                     ))
 
-        # C006: Stale vs_parent
-        fresh = get_fresh_vs_parent(g, run)
-        stored = run.frontmatter.get("vs_parent")
-        if fresh is not None:
-            if not isinstance(stored, dict) or stored.get("inputs_hash") != fresh["inputs_hash"]:
-                add(Issue(
-                    "C006", WARN, "hygiene", run.id,
-                    f"{run.id}.vs_parent is stale or missing (inputs_hash mismatch)",
-                    "Run `contour check --fix` to recompute derived `vs_parent`.",
-                ))
-        elif stored is not None:
-            add(Issue(
-                "C006", WARN, "hygiene", run.id,
-                f"{run.id}.vs_parent is non-null despite missing/non-final baseline",
-                "Run `contour check --fix` to clear stale `vs_parent`.",
-            ))
-
-        # C009: Metric hygiene (config + run metrics)
         for mkey in run.metrics:
             if not is_valid_metric_key(mkey):
                 add(Issue(
@@ -427,55 +400,138 @@ def find_check_issues(
                 add(Issue(
                     "C009", WARN, "hygiene", run.id,
                     f"{run.id} logs undeclared metric {mkey!r} missing from contour.yaml",
-                    f"Register `{mkey}` (direction, kind, min_delta) in contour.yaml.",
+                    f"Register `{mkey}` (direction, kind, min_delta / min_rel_delta) in contour.yaml.",
                 ))
+
+        _check_local_artifacts(g, run, add)
+
+    # --- Analyses -----------------------------------------------------------
+    for ana in g.analyses.values():
+        if ana.kind not in ANALYSIS_KINDS:
+            add(Issue(
+                "C001", ERROR, "hygiene", ana.id,
+                f"{ana.id} has invalid kind {ana.kind!r} (expected one of {ANALYSIS_KINDS})",
+                f"Set `kind` to one of {ANALYSIS_KINDS}.",
+            ))
+        if ana.status not in RUN_STATUSES:
+            add(Issue(
+                "C001", ERROR, "hygiene", ana.id,
+                f"{ana.id} has invalid status {ana.status!r} (expected one of {RUN_STATUSES})",
+                f"Set `status` to one of {RUN_STATUSES}.",
+            ))
+        if "bugged" in ana.frontmatter and not isinstance(ana.frontmatter["bugged"], bool):
+            add(Issue(
+                "C001", ERROR, "hygiene", ana.id,
+                f"{ana.id}.bugged must be a boolean",
+                "Set `bugged: true` (or remove the key if valid).",
+            ))
+
+        for sid in ana.subjects:
+            if sid not in g.runs:
+                add(Issue(
+                    "C001", ERROR, "hygiene", ana.id,
+                    f"{ana.id}.subjects references missing run {sid}",
+                    "Fix the subject wikilink or restore the missing run file.",
+                    (sid,),
+                ))
+            elif ana.is_usable_evidence and not g.runs[sid].is_usable_evidence:
+                srun = g.runs[sid]
+                add(Issue(
+                    "C002", ERROR, "hygiene", ana.id,
+                    f"{ana.id} depends on non-usable subject run {sid} (status={srun.status}, bugged={srun.bugged})",
+                    f"Quarantine {ana.id} (`bugged: true`) or re-run on a valid subject.",
+                    (sid,),
+                ))
+
+        for ref in ana.refs("motivated_by"):
+            if ref not in g.all_nodes:
+                add(Issue(
+                    "C001", ERROR, "hygiene", ana.id,
+                    f"{ana.id}.motivated_by references missing node {ref}",
+                    "Fix the motivated_by wikilink.",
+                    (ref,),
+                ))
+            elif ref in g.claims and ana.is_usable_evidence and ana.id not in claim_linked_evidence.get(ref, set()):
+                add(Issue(
+                    "C003", WARN, "hygiene", ref,
+                    f"{ana.id} was motivated by {ref}, but {ref} has not linked it",
+                    f"Run `contour link {ana.id} {ref} --as <relation>` and synthesize it into {ref}.",
+                    (ana.id,),
+                ))
+
+        if ana.status == "final" and not ana.bugged and "- TODO:" in ana.body:
+            add(Issue(
+                "C004", WARN, "hygiene", ana.id,
+                f"{ana.id} (final) still contains unfilled `- TODO:` placeholder",
+                "Summarize the key finding in `## Key Takeaway (TL;DR)`.",
+            ))
+
+        if ana.status == "running":
+            created = _parse_iso_utc(ana.get("created_at"))
+            if created is not None:
+                age_hours = (now_dt - created).total_seconds() / 3600.0
+                if age_hours > STUCK_RUN_HOURS:
+                    add(Issue(
+                        "C005", WARN, "hygiene", ana.id,
+                        f"{ana.id} has been `running` for {age_hours:.1f}h (> {STUCK_RUN_HOURS:.0f}h)",
+                        "Set `status: failed` if the job died, or finish/resume the analysis.",
+                    ))
+
+        if ana.kind == "eval":
+            for mkey in ana.metrics:
+                if not is_valid_metric_key(mkey):
+                    add(Issue(
+                        "C009", WARN, "hygiene", ana.id,
+                        f"{ana.id} (eval) logs malformed metric key {mkey!r} (expected `<scope>/<lowercase_name>`)",
+                        "Use `<scope>/<name>` metric naming in `contour.yaml` and eval scripts.",
+                    ))
+                elif not g.config.has_metric(mkey):
+                    add(Issue(
+                        "C009", WARN, "hygiene", ana.id,
+                        f"{ana.id} (eval) logs undeclared metric {mkey!r} missing from contour.yaml",
+                        f"Register `{mkey}` (direction, kind, min_delta / min_rel_delta) in contour.yaml.",
+                    ))
+
+        _check_local_artifacts(g, ana, add)
 
     for mkey in sorted(g.config.metrics):
         kind = g.config.metric_kind(mkey)
-        if kind in ("quality", "cost") and g.config.min_delta(mkey) is None:
+        if kind in ("quality", "cost") and not g.config.has_threshold(mkey):
             add(Issue(
                 "C009", WARN, "hygiene", "contour.yaml",
-                f"Metric {mkey!r} ({kind}) in contour.yaml lacks `min_delta`",
-                f"Add `min_delta` for `{mkey}` in contour.yaml.",
+                f"Metric {mkey!r} ({kind}) in contour.yaml lacks `min_delta` / `min_rel_delta`",
+                f"Add `min_delta` and/or `min_rel_delta` for `{mkey}` in contour.yaml.",
             ))
 
     return issues
 
 
 def fix_stale_vs_parent(g: ContourGraph) -> list[str]:
-    """Recompute and write ONLY `vs_parent` on runs where it is stale (§4.1, §5.1)."""
-    fixed: list[str] = []
-    for run in g.runs.values():
-        fresh = get_fresh_vs_parent(g, run)
-        stored = run.frontmatter.get("vs_parent")
-        needs_write = False
-        if fresh is not None:
-            if not isinstance(stored, dict) or stored.get("inputs_hash") != fresh["inputs_hash"]:
-                needs_write = True
-        elif stored is not None:
-            needs_write = True
-        if needs_write:
-            fm, body = parse_markdown_file(run.path)
-            fm["vs_parent"] = fresh
-            write_markdown_file(run.path, fm, body)
-            run.frontmatter["vs_parent"] = fresh
-            fixed.append(run.id)
-    return fixed
+    """No-op kept for API compatibility: comparisons are computed dynamically in memory."""
+    return []
 
 
 def issues_blocking_verify(g: ContourGraph, claim_id: str) -> list[Issue]:
-    """Gate (§5.2): exits non-zero while any ERROR or epistemic issue applies to the claim or its `supports` runs."""
+    """Gate: exits non-zero while any ERROR or epistemic issue applies to the claim or its supports."""
     claim = g.claims.get(claim_id)
     if not claim:
         return []
     sup_ids = set(claim.refs("supports"))
+    related_ids = set(sup_ids)
+    for eid in list(sup_ids):
+        ana = g.analyses.get(eid)
+        if ana is not None:
+            related_ids.update(ana.subjects)
     all_issues = find_check_issues(g)
     blocking: list[Issue] = []
     for issue in all_issues:
         if issue.code == "C008" and issue.node == claim_id:
-            # C008 is precisely what `contour verify` resolves!
             continue
-        applies_to_claim = issue.node == claim_id or bool(sup_ids & set(issue.related_nodes)) or issue.node in sup_ids
+        applies_to_claim = (
+            issue.node == claim_id
+            or bool(related_ids & set(issue.related_nodes))
+            or issue.node in related_ids
+        )
         if applies_to_claim and (issue.severity == ERROR or issue.category == "epistemic"):
             blocking.append(issue)
     return blocking
@@ -489,16 +545,17 @@ def select_primary_metric(
     if metric_filter:
         return metric_filter
     for r in runs:
-        for k in r.metrics:
+        for k in g.effective_run_metrics(r):
             if g.config.is_primary_metric(k):
                 return k
     for r in runs:
-        for k in r.metrics:
+        for k in g.effective_run_metrics(r):
             if g.config.metric_kind(k) == "quality":
                 return k
     for r in runs:
-        if r.metrics:
-            return next(iter(r.metrics))
+        eff = g.effective_run_metrics(r)
+        if eff:
+            return next(iter(eff))
     return None
 
 
@@ -507,10 +564,10 @@ def frontier_metrics(
     runs: list[ContourNode],
     metric_filter: str | None = None,
 ) -> list[str]:
-    """Return all primary metrics present in `runs`, or a fallback single metric."""
+    """Return all primary metrics present across inline + attached `kind: eval` metrics."""
     if metric_filter:
         return [metric_filter]
-    present = {k for r in runs for k in r.metrics}
+    present = {k for r in runs for k in g.effective_run_metrics(r)}
     primaries = [k for k in g.config.metrics if k in present and g.config.is_primary_metric(k)]
     if primaries:
         return primaries
@@ -520,24 +577,22 @@ def frontier_metrics(
 
 def compute_frontier(
     g: ContourGraph,
-    task: str | None = None,
     metric_filter: str | None = None,
 ) -> tuple[str | None, str, list[ContourNode], set[str]]:
-    """Compute primary metric vs GPU-hours Pareto frontier (§6.1)."""
+    """Compute primary metric vs GPU-hours Pareto frontier (composing inline + attached `kind: eval`)."""
     runs = g.usable_runs()
-    if task:
-        runs = [r for r in runs if r.get("task") == task]
     if not runs:
         return None, "max", [], set()
 
     primary_metric = select_primary_metric(g, runs, metric_filter)
     direction = g.config.metric_direction(primary_metric) if primary_metric else "max"
     lower_is_better = direction == "min"
+    eff_map = {r.id: g.effective_run_metrics(r) for r in runs}
     if primary_metric:
-        runs = [r for r in runs if primary_metric in r.metrics]
+        runs = [r for r in runs if primary_metric in eff_map[r.id]]
 
     def sort_key(node: ContourNode) -> tuple[int, float, float]:
-        val = node.metrics.get(primary_metric or "")
+        val = eff_map[node.id].get(primary_metric or "")
         if val is None:
             return (1, 0.0, float("inf"))
         q_key = float(val) if lower_is_better else -float(val)
@@ -550,7 +605,7 @@ def compute_frontier(
     best_cost_so_far = float("inf")
     for r in runs:
         cost = r.gpu_hours
-        val = r.metrics.get(primary_metric or "")
+        val = eff_map[r.id].get(primary_metric or "")
         if val is not None and cost is not None and cost < best_cost_so_far:
             pareto_ids.add(r.id)
             best_cost_so_far = cost
@@ -558,7 +613,7 @@ def compute_frontier(
 
 
 def find_review_items(g: ContourGraph) -> dict[str, Any]:
-    """Selective human review inbox (§5.4)."""
+    """Tier-3 selective human review inbox."""
     awaiting_signoff: list[dict[str, Any]] = []
     stale_verified: list[dict[str, Any]] = []
 
@@ -585,30 +640,25 @@ def find_review_items(g: ContourGraph) -> dict[str, Any]:
                 "contradicts": claim.refs("contradicts"),
             })
 
-    # Prioritize stale claims with contradictions first (§5.4)
     stale_verified.sort(key=lambda item: (not item["has_contradicts"], item["id"]))
 
-    # Frontier runs with code.dirty == true (across every primary metric per task)
     usable = g.usable_runs()
-    tasks = sorted({str(r.get("task")) for r in usable if r.get("task")})
     dirty_frontier_seen: set[str] = set()
     dirty_frontier: list[dict[str, Any]] = []
-    for t in (tasks or [None]):  # type: ignore[list-item]
-        t_runs = [r for r in usable if t is None or r.get("task") == t]
-        for fm_metric in frontier_metrics(g, t_runs):
-            metric, _, runs, pareto_ids = compute_frontier(g, task=t, metric_filter=fm_metric)
-            for r in runs:
-                if r.id in pareto_ids and bool(r.code.get("dirty")) and r.id not in dirty_frontier_seen:
-                    dirty_frontier_seen.add(r.id)
-                    dirty_frontier.append({
-                        "id": r.id,
-                        "task": r.get("task"),
-                        "title": r.title,
-                        "metric": metric,
-                        "value": r.metrics.get(metric or ""),
-                        "gpu_hours": r.gpu_hours,
-                        "commit": r.code.get("commit"),
-                    })
+    for fm_metric in frontier_metrics(g, usable):
+        metric, _, runs, pareto_ids = compute_frontier(g, metric_filter=fm_metric)
+        for r in runs:
+            if r.id in pareto_ids and bool(r.code.get("dirty")) and r.id not in dirty_frontier_seen:
+                dirty_frontier_seen.add(r.id)
+                eff_m = g.effective_run_metrics(r)
+                dirty_frontier.append({
+                    "id": r.id,
+                    "title": r.title,
+                    "metric": metric,
+                    "value": eff_m.get(metric or ""),
+                    "gpu_hours": r.gpu_hours,
+                    "commit": r.code.get("commit"),
+                })
 
     return {
         "awaiting_signoff": awaiting_signoff,

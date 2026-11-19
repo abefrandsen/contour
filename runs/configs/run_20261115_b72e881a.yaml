@@ -1,0 +1,7 @@
+lr: 0.002
+warmup_epochs: 5
+qkv_rank: full
+qk_norm: true
+seed: 0
+dataset_train:
+- imagenet1k_train_v1

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contour-research"
-version = "1.0.0"
-description = "Epistemic ML Research Framework (Goals, Claims, Runs)"
+version = "1.1.0"
+description = "Epistemic ML Research Framework (Goals, Claims, Runs, Analyses)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

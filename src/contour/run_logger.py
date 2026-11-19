@@ -1,8 +1,9 @@
-"""Local-first Contour Run logger writing directly to `runs/run_<YYYYMMDD>_<8hex>.md`."""
+"""Local-first Contour Run & Analysis loggers writing lean Markdown + sidecar YAML configs."""
 
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -12,40 +13,72 @@ import time
 from typing import Any
 import uuid
 
-from .compare import compute_vs_parent
-from .config import ConfigError, find_root, load_config
-from .graph import DEFAULT_VALIDITY, RUN_TIERS
-from .mdio import as_wikilink, parse_markdown_file, strip_wiki, write_markdown_file
+import yaml
+
+from .config import ConfigError, find_root
+from .graph import ANALYSIS_KINDS, normalize_artifacts
+from .mdio import as_wikilink, parse_markdown_file, write_markdown_file
 
 RUNS_DIR = "runs"
+RUN_CONFIGS_SUBDIR = "runs/configs"
+ANALYSES_DIR = "analyses"
 
-AUTHOR_KEYS = (
-    "id",
-    "type",
+RUN_AUTHOR_KEYS = (
     "title",
-    "validity",
-    "interventions",
-    "intervention_note",
-    "parent_runs",
-    "baseline",
+    "bugged",
+    "parent",
     "motivated_by",
 )
 
-LOGGER_KEYS = (
+RUN_LOGGER_KEYS = (
     "status",
     "created_at",
     "finished_at",
-    "task",
-    "arch_family",
-    "arch_scale",
-    "dataset_train",
-    "tier",
+    "config_path",
     "config",
     "compute",
     "code",
     "launch_cmd",
+    "artifacts",
     "metrics",
 )
+
+ANALYSIS_AUTHOR_KEYS = (
+    "kind",
+    "title",
+    "bugged",
+    "subjects",
+    "motivated_by",
+)
+
+ANALYSIS_LOGGER_KEYS = (
+    "status",
+    "created_at",
+    "finished_at",
+    "script",
+    "script_sha256",
+    "code",
+    "launch_cmd",
+    "artifacts",
+    "metrics",
+)
+
+AUTHOR_KEYS = RUN_AUTHOR_KEYS
+LOGGER_KEYS = RUN_LOGGER_KEYS
+
+_OMIT_WHEN_EMPTY = frozenset({
+    "parent",
+    "motivated_by",
+    "finished_at",
+    "config_path",
+    "config",
+    "compute",
+    "artifacts",
+    "script",
+    "script_sha256",
+    "launch_cmd",
+    "subjects",
+})
 
 
 def _normalize_str_list(val: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -120,22 +153,36 @@ def _get_git_info(cwd: Path | None = None) -> dict[str, Any]:
     return info
 
 
-def _run_id_for(created_at: str) -> str:
+def _script_info(script: str | Path | None, root: Path | None = None) -> tuple[str | None, str | None]:
+    """Resolve script path (preferring relative to `root`) and compute its 16-hex SHA-256."""
+    raw = str(script) if script is not None else (sys.argv[0] if sys.argv else "")
+    raw = raw.strip()
+    if not raw or raw in ("-c", "-m", "<stdin>"):
+        return None, None
+    p = Path(raw)
+    resolved = p if p.is_absolute() else p.resolve()
+    sha: str | None = None
+    if resolved.is_file():
+        sha = hashlib.sha256(resolved.read_bytes()).hexdigest()[:16]
+    display = raw
+    if root is not None:
+        try:
+            display = str(resolved.relative_to(root.resolve()))
+        except ValueError:
+            try:
+                display = str(resolved.relative_to(root.resolve().parent))
+            except ValueError:
+                display = raw
+    return display, sha
+
+
+def _id_for(prefix: str, created_at: str) -> str:
     date_part = created_at[:10].replace("-", "")
-    return f"run_{date_part}_{uuid.uuid4().hex[:8]}"
+    return f"{prefix}_{date_part}_{uuid.uuid4().hex[:8]}"
 
 
-def _resolve_run_fm(runs_dir: Path, ref_id: str) -> dict[str, Any] | None:
-    rid = strip_wiki(ref_id)
-    p = runs_dir / f"{rid}.md"
-    if not p.exists():
-        return None
-    fm, _ = parse_markdown_file(p)
-    return fm
-
-
-def _default_run_body(parent_refs: list[str], notes: str | None) -> str:
-    ref = parent_refs[0] if parent_refs else "baseline"
+def _default_run_body(parent_ref: str | None, notes: str | None) -> str:
+    ref = parent_ref or "baseline"
     obs = f"- {notes}\n" if notes else "- \n"
     return (
         "## Key Takeaway (TL;DR)\n"
@@ -145,12 +192,43 @@ def _default_run_body(parent_refs: list[str], notes: str | None) -> str:
     )
 
 
-def ingest_record(root: Path, record: dict[str, Any], notes: str | None = None) -> Path:
-    """Write or update `runs/<id>.md` from a run record dict.
+def _default_analysis_body(subjects: list[str], notes: str | None) -> str:
+    subj_str = ", ".join(subjects) if subjects else "target dataset/checkpoints"
+    obs = f"- {notes}\n" if notes else "- \n"
+    return (
+        "## Key Takeaway (TL;DR)\n"
+        f"- TODO: Summarize key finding on {subj_str}.\n\n"
+        "## Findings & Observations\n"
+        f"{obs}"
+    )
 
-    Preserves author-owned keys and Markdown body if the run file already exists.
-    Computes `vs_parent` on `status == 'final'` when an effective baseline is available.
-    """
+
+def _compact_frontmatter(fm: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in fm.items():
+        if k in ("id", "type", "vs_parent"):
+            continue
+        if k == "bugged" and not v:
+            continue
+        if k in _OMIT_WHEN_EMPTY and (v is None or v == [] or v == {}):
+            continue
+        out[k] = v
+    return out
+
+
+def _write_sidecar_config(root: Path, subdir: str, node_id: str, cfg: dict[str, Any]) -> str:
+    rel = f"{subdir}/{node_id}.yaml"
+    cfg_path = root / rel
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True, default_flow_style=False),
+        encoding="utf-8",
+    )
+    return rel
+
+
+def ingest_record(root: Path, record: dict[str, Any], notes: str | None = None) -> Path:
+    """Write or update `runs/<id>.md` (and sidecar `runs/configs/<id>.yaml`) from a run record dict."""
     runs_dir = root / RUNS_DIR
     runs_dir.mkdir(parents=True, exist_ok=True)
     run_id = str(record["id"])
@@ -161,67 +239,82 @@ def ingest_record(root: Path, record: dict[str, Any], notes: str | None = None) 
     if path.exists():
         existing_fm, body = parse_markdown_file(path)
 
-    # Author keys: keep existing if file already exists, else seed from record
+    rec = dict(record)
+    raw_cfg = rec.get("config")
+    if isinstance(raw_cfg, dict) and raw_cfg:
+        rec["config_path"] = _write_sidecar_config(root, RUN_CONFIGS_SUBDIR, run_id, raw_cfg)
+        rec["config"] = None
+
     merged: dict[str, Any] = {}
-    for k in AUTHOR_KEYS:
+    for k in RUN_AUTHOR_KEYS:
+        if path.exists() and k in existing_fm:
+            merged[k] = existing_fm[k]
+        else:
+            merged[k] = rec.get(k)
+
+    for k in RUN_LOGGER_KEYS:
+        merged[k] = rec.get(k)
+
+    known = set(RUN_AUTHOR_KEYS) | set(RUN_LOGGER_KEYS) | {"id", "type", "vs_parent"}
+    for k, v in existing_fm.items():
+        if k not in known:
+            merged[k] = v
+
+    merged = _compact_frontmatter(merged)
+    if not body.strip():
+        body = _default_run_body(merged.get("parent"), notes)
+
+    write_markdown_file(path, merged, body)
+    return path
+
+
+def ingest_analysis_record(root: Path, record: dict[str, Any], notes: str | None = None) -> Path:
+    """Write or update `analyses/<id>.md` from an analysis record dict."""
+    ana_dir = root / ANALYSES_DIR
+    ana_dir.mkdir(parents=True, exist_ok=True)
+    ana_id = str(record["id"])
+    path = ana_dir / f"{ana_id}.md"
+
+    existing_fm: dict[str, Any] = {}
+    body = ""
+    if path.exists():
+        existing_fm, body = parse_markdown_file(path)
+
+    merged: dict[str, Any] = {}
+    for k in ANALYSIS_AUTHOR_KEYS:
         if path.exists() and k in existing_fm:
             merged[k] = existing_fm[k]
         else:
             merged[k] = record.get(k)
 
-    # Logger keys: always authoritative from record
-    for k in LOGGER_KEYS:
+    for k in ANALYSIS_LOGGER_KEYS:
         merged[k] = record.get(k)
 
-    # Preserve any extra author-added frontmatter keys
-    known = set(AUTHOR_KEYS) | set(LOGGER_KEYS) | {"vs_parent"}
+    known = set(ANALYSIS_AUTHOR_KEYS) | set(ANALYSIS_LOGGER_KEYS) | {"id", "type"}
     for k, v in existing_fm.items():
         if k not in known:
             merged[k] = v
 
-    # Derive vs_parent when status == 'final'
-    vs_parent = None
-    if merged.get("status") == "final":
-        base_ref = merged.get("baseline") or (
-            merged["parent_runs"][0] if merged.get("parent_runs") else None
-        )
-        if base_ref:
-            base_fm = _resolve_run_fm(runs_dir, str(base_ref))
-            if base_fm is not None:
-                try:
-                    cfg = load_config(root)
-                except ConfigError:
-                    cfg = None
-                if cfg is not None:
-                    vs_parent = compute_vs_parent(merged, base_fm, cfg)
-    merged["vs_parent"] = vs_parent
-
+    merged = _compact_frontmatter(merged)
     if not body.strip():
-        body = _default_run_body(merged.get("parent_runs") or [], notes)
+        body = _default_analysis_body(merged.get("subjects") or [], notes)
 
     write_markdown_file(path, merged, body)
     return path
 
 
 class Run:
-    """Local-first Contour run logger writing `runs/run_<YYYYMMDD>_<8hex>.md`."""
+    """Local-first Contour training run logger writing `runs/run_<YYYYMMDD>_<8hex>.md`."""
 
     def __init__(
         self,
         title: str | None = None,
         *,
         exp_name: str | None = None,
-        task: str = "unspecified",
-        dataset_train: str | list[str] = (),
-        arch_family: str = "unspecified",
-        arch_scale: str = "unspecified",
-        interventions: list[str] | str | None = None,
-        intervention_note: str | None = None,
-        parent_runs: list[str] | None = None,
-        baseline: str | None = None,
+        parent: str | None = None,
         motivated_by: list[str] | None = None,
-        tier: str = "proxy",
         config: dict[str, Any] | None = None,
+        artifacts: list[dict[str, Any]] | dict[str, Any] | list[str] | None = None,
         launch_cmd: str | None = None,
         num_gpus: int | None = None,
         rank_zero_only: bool = True,
@@ -229,8 +322,6 @@ class Run:
         git_cwd: str | Path | None = None,
         notes: str | None = None,
     ) -> None:
-        if tier not in RUN_TIERS:
-            raise ValueError(f"tier must be one of {RUN_TIERS}, got {tier!r}")
         resolved_title = title or exp_name
         if not resolved_title:
             raise ValueError("Run requires `title`")
@@ -249,21 +340,14 @@ class Run:
 
         self.created_at = _utc_now_iso()
         self.finished_at: str | None = None
-        self.id = _run_id_for(self.created_at)
+        self.id = _id_for("run", self.created_at)
         self.title = resolved_title
-        self.validity = DEFAULT_VALIDITY
+        self.bugged = False
         self.status = "running"
-        self.tier = tier
-        self.task = task
-        self.arch_family = arch_family
-        self.arch_scale = arch_scale
-        self.dataset_train = _normalize_str_list(dataset_train)
-        self.interventions = _normalize_str_list(interventions)
-        self.intervention_note = intervention_note
-        self.parent_runs = [as_wikilink(p) for p in _normalize_str_list(parent_runs)]
-        self.baseline = as_wikilink(baseline) if baseline else None
+        self.parent = as_wikilink(parent) if parent else None
         self.motivated_by = [as_wikilink(m) for m in _normalize_str_list(motivated_by)]
         self.config: dict[str, Any] = dict(config or {})
+        self.artifacts: list[dict[str, Any]] = normalize_artifacts(artifacts)
         self.metrics: dict[str, float] = {}
         self.notes = notes
 
@@ -290,7 +374,6 @@ class Run:
         step: int | None = None,  # accepted for training-loop compatibility
         context: dict[str, Any] | None = None,
     ) -> None:
-        """Record a scalar metric (`<scope>/<name>` when `context={'subset': ...}` is used)."""
         if not self.enabled:
             return
         val = float(value)
@@ -298,6 +381,22 @@ class Run:
             raise ValueError(f"Metric {name!r} must be finite, got {value!r}")
         key = f"{context['subset']}/{name}" if context and "subset" in context else name
         self.metrics[key] = round(val, 6)
+
+    def add_artifact(
+        self,
+        path: str | Path,
+        *,
+        kind: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        entry: dict[str, Any] = {"path": str(path)}
+        if kind:
+            entry["kind"] = kind
+        if note:
+            entry["note"] = note
+        self.artifacts.append(entry)
 
     def set_compute_budget(
         self,
@@ -316,29 +415,20 @@ class Run:
             self.compute["num_gpus"] = int(num_gpus)
 
     def to_record(self) -> dict[str, Any]:
-        """Serialize Run fields into a canonical record dict."""
         return {
             "id": self.id,
-            "type": "run",
             "title": self.title,
-            "validity": self.validity,
-            "interventions": list(self.interventions),
-            "intervention_note": self.intervention_note,
-            "parent_runs": list(self.parent_runs),
-            "baseline": self.baseline,
+            "bugged": self.bugged,
+            "parent": self.parent,
             "motivated_by": list(self.motivated_by),
             "status": self.status,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
-            "task": self.task,
-            "arch_family": self.arch_family,
-            "arch_scale": self.arch_scale,
-            "dataset_train": list(self.dataset_train),
-            "tier": self.tier,
             "config": dict(self.config),
             "compute": {k: v for k, v in self.compute.items() if v is not None},
             "code": dict(self.code),
             "launch_cmd": self.launch_cmd,
+            "artifacts": list(self.artifacts),
             "metrics": dict(self.metrics),
         }
 
@@ -361,6 +451,138 @@ class Run:
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close(failed=exc_type is not None)
+
+
+class Analysis:
+    """Local-first Contour analysis/eval logger writing `analyses/ana_<YYYYMMDD>_<8hex>.md`."""
+
+    def __init__(
+        self,
+        title: str,
+        *,
+        kind: str = "analysis",
+        subjects: list[str] | str | None = None,
+        motivated_by: list[str] | None = None,
+        artifacts: list[dict[str, Any]] | dict[str, Any] | list[str] | None = None,
+        script: str | Path | None = None,
+        launch_cmd: str | None = None,
+        rank_zero_only: bool = True,
+        root: str | Path | None = None,
+        git_cwd: str | Path | None = None,
+        notes: str | None = None,
+    ) -> None:
+        if kind not in ANALYSIS_KINDS:
+            raise ValueError(f"kind must be one of {ANALYSIS_KINDS}, got {kind!r}")
+        if not title:
+            raise ValueError("Analysis requires `title`")
+
+        self.rank = _detect_rank()
+        self.enabled = (self.rank == 0) or (not rank_zero_only)
+
+        self.root: Path | None
+        if root is not None:
+            self.root = find_root(explicit=Path(root))
+        else:
+            try:
+                self.root = find_root(start=Path(git_cwd) if git_cwd else None)
+            except ConfigError:
+                self.root = None
+
+        self.created_at = _utc_now_iso()
+        self.finished_at: str | None = None
+        self.id = _id_for("ana", self.created_at)
+        self.kind = kind
+        self.title = title
+        self.bugged = False
+        self.status = "running"
+        self.subjects = [as_wikilink(s) for s in _normalize_str_list(subjects)]
+        self.motivated_by = [as_wikilink(m) for m in _normalize_str_list(motivated_by)]
+        self.artifacts: list[dict[str, Any]] = normalize_artifacts(artifacts)
+        self.metrics: dict[str, float] = {}
+        self.notes = notes
+
+        git_dir = Path(git_cwd) if git_cwd else self.root
+        self.code = _get_git_info(git_dir) if self.enabled else {"commit": None, "dirty": False}
+        self.script, self.script_sha256 = _script_info(script, self.root) if self.enabled else (None, None)
+        self.launch_cmd = launch_cmd or os.environ.get("LAUNCH_CMD") or " ".join(sys.argv)
+        self._closed = False
+        self.path: Path | None = None
+
+        if self.enabled and self.root is not None:
+            self.path = ingest_analysis_record(self.root, self.to_record(), notes=self.notes)
+
+    def track(
+        self,
+        value: float,
+        name: str,
+        step: int | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        val = float(value)
+        if not math.isfinite(val):
+            raise ValueError(f"Metric {name!r} must be finite, got {value!r}")
+        key = f"{context['subset']}/{name}" if context and "subset" in context else name
+        self.metrics[key] = round(val, 6)
+
+    def add_artifact(
+        self,
+        path: str | Path,
+        *,
+        kind: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        entry: dict[str, Any] = {"path": str(path)}
+        if kind:
+            entry["kind"] = kind
+        if note:
+            entry["note"] = note
+        self.artifacts.append(entry)
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "title": self.title,
+            "bugged": self.bugged,
+            "subjects": list(self.subjects),
+            "motivated_by": list(self.motivated_by),
+            "status": self.status,
+            "created_at": self.created_at,
+            "finished_at": self.finished_at,
+            "script": self.script,
+            "script_sha256": self.script_sha256,
+            "code": dict(self.code),
+            "launch_cmd": self.launch_cmd,
+            "artifacts": list(self.artifacts),
+            "metrics": dict(self.metrics),
+        }
+
+    def close(self, failed: bool = False) -> Path | None:
+        if self._closed or not self.enabled:
+            return self.path
+        self._closed = True
+        self.finished_at = _utc_now_iso()
+        if self.status == "running":
+            self.status = "failed" if failed else "final"
+        if self.root is not None:
+            self.path = ingest_analysis_record(self.root, self.to_record(), notes=self.notes)
+        return self.path
+
+    def __enter__(self) -> Analysis:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close(failed=exc_type is not None)
+
+
+def Eval(title: str, **kwargs: Any) -> Analysis:
+    """Convenience constructor for a standardized post-hoc `Analysis(kind='eval')`."""
+    kwargs.setdefault("kind", "eval")
+    return Analysis(title, **kwargs)
 
 
 def init_run(**kwargs: Any) -> Run:
