@@ -1,4 +1,4 @@
-"""Contour CLI: Research state integrity, daily workflows, introspection, and ideation."""
+"""Contour CLI: Focused transitions (`init`, `new`, `link`, `verify`) and observables (`brief`, `ls`, `show`, `compare`, `frontier`, `check`, `ideate`, `report`)."""
 
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ from .check import (
     effective_verification,
     evidence_control_level,
     find_check_issues,
-    find_review_items,
     frontier_metrics,
     issues_blocking_verify,
 )
@@ -72,8 +71,8 @@ def _bundled_skill_markdown() -> str:
         "description: Navigate, brief, verify, analyze, report, and ideate over the Contour ML research state.\n"
         "---\n\n"
         "# Contour: Epistemic ML Research Copilot Skill\n\n"
-        "Run `contour brief --json`, `contour status --json`, `contour runs --tree`, "
-        "`contour analyses --json`, `contour check --json`, `contour report --json`, and `contour ideate --json`.\n"
+        "Run `contour brief --json`, `contour ls --json`, `contour check --json`, "
+        "`contour report --json`, and `contour ideate --json`.\n"
     )
 
 
@@ -146,7 +145,7 @@ def _print_diff_details(vs: dict[str, Any], indent: str = "  ") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Commands
+# Transition Commands (`init`, `new`, `link`, `verify`)
 # ---------------------------------------------------------------------------
 
 
@@ -336,27 +335,6 @@ def cmd_link(
     print(f"Linked {eid} -> {cid} under `{relation}`{badge}")
 
 
-def cmd_check(g: ContourGraph, strict: bool = False, as_json: bool = False) -> None:
-    issues = find_check_issues(g)
-    if as_json:
-        _emit_json({
-            "count": len(issues),
-            "issues": [i.as_dict() for i in issues],
-        })
-    else:
-        print("=== CONTOUR MECHANICAL CHECK ===")
-        if not issues:
-            print("All goals, claims, runs, and analyses pass mechanical verification!")
-        else:
-            for item in issues:
-                print(f" - [{item.code}/{item.severity.upper()}/{item.category}] ({item.node}) {item.message}")
-                print(f"     remediation: {item.remediation}")
-
-    has_error = any(i.severity == ERROR for i in issues)
-    if has_error or (strict and bool(issues)):
-        raise SystemExit(1)
-
-
 def cmd_verify(
     g: ContourGraph,
     claim_id: str,
@@ -405,124 +383,30 @@ def cmd_verify(
     print(f"Verified {cid} -> {target_verif} (verified_hash={vhash})")
 
 
-def cmd_review(g: ContourGraph, as_json: bool = False) -> None:
-    items = find_review_items(g)
-    if as_json:
-        _emit_json(items)
-        return
-
-    print("=== CONTOUR HUMAN REVIEW INBOX ===")
-    awaiting = items["awaiting_signoff"]
-    stale = items["stale_verified"]
-    dirty = items["dirty_frontier"]
-
-    print(f"\n[1. Claims Awaiting Human Sign-Off] ({len(awaiting)})")
-    for c in awaiting:
-        print(f"  * {c['id']} [{c['status']}]: {c['title']}")
-        print(f"    +supports={c['supports']} | -contradicts={c['contradicts']} | ~qualifies={c['qualifies']}")
-        if c.get("audit_note"):
-            print(f"    audit_note: {c['audit_note']}")
-
-    print(f"\n[2. Verified Claims Gone Stale] ({len(stale)})")
-    for c in stale:
-        flag = " [CONTRADICTED]" if c["has_contradicts"] else ""
-        print(f"  * {c['id']} [{c['status']} | was {c['stored_verification']}]{flag}: {c['title']}")
-
-    print(f"\n[3. Frontier Runs with Uncommitted Code (`code.dirty: true`)] ({len(dirty)})")
-    for r in dirty:
-        print(f"  * {r['id']}: {r['metric']}={r['value']} @ {r['gpu_hours']}h (commit={r['commit']})")
-
-    if not (awaiting or stale or dirty):
-        print("\nNothing in the human review queue.")
+# ---------------------------------------------------------------------------
+# Observable Commands (`brief`, `ls`, `show`, `compare`, `frontier`, `check`, `ideate`, `report`)
+# ---------------------------------------------------------------------------
 
 
-def cmd_status(g: ContourGraph, as_json: bool = False) -> None:
-    covered_claims: set[str] = set()
-    goals_out: list[dict[str, Any]] = []
-    for goal in g.goals.values():
-        g_claims = g.goal_claims(goal.id)
-        claim_list = []
-        for c in g_claims:
-            covered_claims.add(c.id)
-            edges = g.claim_edges(c)
-            claim_list.append({
-                "id": c.id,
-                "status": c.status,
-                "verification": effective_verification(g, c),
-                "stored_verification": c.verification,
-                "title": c.title,
-                "counts": {k: len(v) for k, v in edges.items()},
-            })
-        goals_out.append({
-            "id": goal.id,
-            "status": goal.status,
-            "title": goal.title,
-            "tldr": goal.tldr,
-            "open_questions": goal.open_questions,
-            "claims": claim_list,
-        })
-
-    unassigned = [
-        {
-            "id": c.id,
-            "status": c.status,
-            "verification": effective_verification(g, c),
-            "title": c.title,
-            "counts": {k: len(v) for k, v in g.claim_edges(c).items()},
-        }
-        for cid, c in sorted(g.claims.items())
-        if cid not in covered_claims
-    ]
+def cmd_check(g: ContourGraph, strict: bool = False, as_json: bool = False) -> None:
     issues = find_check_issues(g)
-    rev = find_review_items(g)
-    review_count = len(rev["awaiting_signoff"]) + len(rev["stale_verified"]) + len(rev["dirty_frontier"])
-
     if as_json:
         _emit_json({
-            "counts": {
-                "goals": len(g.goals),
-                "claims": len(g.claims),
-                "runs": len(g.runs),
-                "usable_runs": len(g.usable_runs()),
-                "analyses": len(g.analyses),
-                "usable_analyses": len(g.usable_analyses()),
-                "check_issues": len(issues),
-                "review_items": review_count,
-            },
-            "goals": goals_out,
-            "unassigned_claims": unassigned,
+            "count": len(issues),
+            "issues": [i.as_dict() for i in issues],
         })
-        return
+    else:
+        print("=== CONTOUR INVARIANT CHECK ===")
+        if not issues:
+            print("All goals, claims, runs, and analyses pass mechanical verification!")
+        else:
+            for item in issues:
+                print(f" - [{item.code} | {item.severity.upper()} | {item.category}] ({item.node}) {item.message}")
+                print(f"     remediation: {item.remediation}")
 
-    print("=== CONTOUR RESEARCH STATUS ===")
-    print(
-        f"State: {len(g.goals)} Goal(s) | {len(g.claims)} Claim(s) | "
-        f"{len(g.runs)} Run(s) ({len(g.usable_runs())} usable) | "
-        f"{len(g.analyses)} Analysis/Eval(s) ({len(g.usable_analyses())} usable) | "
-        f"check={len(issues)} | review={review_count}\n"
-    )
-    for goal in goals_out:
-        print(f"[GOAL] {goal['id']} ({goal['status'].upper()}): {goal['title']}")
-        if goal["tldr"]:
-            print(f"  Objective: {goal['tldr']}")
-        if goal["open_questions"]:
-            print(f"  Open questions: {len(goal['open_questions'])}")
-        if not goal["claims"]:
-            print("  (No linked claims)")
-        for c in goal["claims"]:
-            cnt = c["counts"]
-            print(f"  └── [CLAIM] {c['id']} [{c['status']} | {c['verification']}]: {c['title']}")
-            print(
-                f"        Evidence: +{cnt['supports']} supports | "
-                f"-{cnt['contradicts']} contradicts | ~{cnt['qualifies']} qualifies"
-            )
-        print()
-
-    if unassigned:
-        print("[UNASSIGNED CLAIMS]")
-        for c in unassigned:
-            print(f"  - {c['id']} [{c['status']} | {c['verification']}]: {c['title']}")
-        print()
+    has_error = any(i.severity == ERROR for i in issues)
+    if has_error or (strict and bool(issues)):
+        raise SystemExit(1)
 
 
 def cmd_show(g: ContourGraph, node_id: str, as_json: bool = False) -> None:
@@ -612,7 +496,8 @@ def cmd_show(g: ContourGraph, node_id: str, as_json: bool = False) -> None:
         print(f"Subjects: {node.subjects}")
         print(f"Commit:   {code.get('commit')} | Dirty: {code.get('dirty')}")
         if node.script:
-            print(f"Script:   {node.script} (sha256={node.script_sha256 or 'N/A'})")
+            tr_s = "tracked" if node.script_tracked else "untracked"
+            print(f"Script:   {node.script} ({tr_s}, sha256={node.script_sha256 or 'N/A'})")
         if node.get("launch_cmd"):
             print(f"Command:  {node.get('launch_cmd')}")
         if node.metrics:
@@ -665,35 +550,32 @@ def cmd_show(g: ContourGraph, node_id: str, as_json: bool = False) -> None:
     print(node.body)
 
 
-def cmd_runs(
+def _filter_runs(
     g: ContourGraph,
     *,
-    tree: bool = False,
     goal_id: str | None = None,
     claim_id: str | None = None,
     eval_scope: str | None = None,
     status: str | None = None,
     control: str | None = None,
     verdict: str | None = None,
-    as_json: bool = False,
-) -> None:
+) -> list[tuple[ContourNode, dict[str, Any] | None]]:
     runs = list(g.runs.values())
-
-    allowed_by_claim: set[str] | None = None
+    allowed: set[str] | None = None
     if goal_id:
         gid = strip_wiki(goal_id)
         g_claims = g.goal_claims(gid)
-        allowed_by_claim = set()
+        allowed = set()
         for c in g_claims:
             for edge in EDGE_KEYS:
                 for eid in c.refs(edge):
                     if eid in g.runs:
-                        allowed_by_claim.add(eid)
+                        allowed.add(eid)
                     elif eid in g.analyses:
-                        allowed_by_claim.update(g.analyses[eid].subjects)
+                        allowed.update(g.analyses[eid].subjects)
         for r in runs:
             if gid in r.refs("motivated_by") or any(c.id in r.refs("motivated_by") for c in g_claims):
-                allowed_by_claim.add(r.id)
+                allowed.add(r.id)
     if claim_id:
         cid = strip_wiki(claim_id)
         cnode = g.claims.get(cid)
@@ -708,11 +590,11 @@ def cmd_runs(
         for r in runs:
             if cid in r.refs("motivated_by"):
                 c_set.add(r.id)
-        allowed_by_claim = c_set if allowed_by_claim is None else (allowed_by_claim & c_set)
+        allowed = c_set if allowed is None else (allowed & c_set)
 
     filtered: list[tuple[ContourNode, dict[str, Any] | None]] = []
     for r in sorted(runs, key=lambda x: x.id):
-        if allowed_by_claim is not None and r.id not in allowed_by_claim:
+        if allowed is not None and r.id not in allowed:
             continue
         if status and r.status != status:
             continue
@@ -728,73 +610,10 @@ def cmd_runs(
         if verdict and verd != verdict:
             continue
         filtered.append((r, vs))
-
-    if as_json:
-        _emit_json({
-            "count": len(filtered),
-            "runs": [
-                {
-                    "id": r.id,
-                    "title": r.title,
-                    "status": r.status,
-                    "bugged": r.bugged,
-                    "gpu_hours": r.gpu_hours,
-                    "parent": r.parent,
-                    "control_level": vs["control_level"] if vs else evidence_control_level(g, r),
-                    "verdict": vs["verdict"] if vs else None,
-                    "flags": vs.get("flags", []) if vs else [],
-                    "primary_delta": _primary_delta_summary(g, vs),
-                }
-                for r, vs in filtered
-            ],
-        })
-        return
-
-    if not filtered:
-        print("No matching runs found.")
-        return
-
-    if tree:
-        print("=== CONTOUR RUN LINEAGE TREE ===")
-        by_id = {r.id: (r, vs) for r, vs in filtered}
-        children: dict[str, list[str]] = {}
-        roots: list[str] = []
-        for r, _ in filtered:
-            p = r.parent
-            if p and p in by_id:
-                children.setdefault(p, []).append(r.id)
-            else:
-                roots.append(r.id)
-
-        def _print_branch(rid: str, prefix: str = "", is_last: bool = True, is_root: bool = True) -> None:
-            r, vs = by_id[rid]
-            if vs:
-                fl = f" !{','.join(vs['flags'])}" if vs.get("flags") else ""
-                badge = f"[{vs['control_level']}/{vs['verdict']} {_primary_delta_summary(g, vs)}{fl}]"
-            else:
-                badge = f"[{r.status} | root]"
-            conn = "" if is_root else ("└── " if is_last else "├── ")
-            print(f"{prefix}{conn}{r.id} {badge} :: {r.title}")
-            kids = children.get(rid, [])
-            child_prefix = "" if is_root else (prefix + ("    " if is_last else "│   "))
-            for idx, kid in enumerate(kids):
-                _print_branch(kid, child_prefix, idx == len(kids) - 1, is_root=False)
-
-        for root_id in roots:
-            _print_branch(root_id)
-        return
-
-    print(f"=== CONTOUR RUNS ({len(filtered)}) ===")
-    print(f"{'ID':<22} {'STATUS':<8} {'CONTROL':<11} {'VERDICT':<15} {'PRIMARY Δ':<20} {'TITLE'}")
-    print("-" * 116)
-    for r, vs in filtered:
-        ctrl_s = vs["control_level"] if vs else evidence_control_level(g, r)
-        verd_s = vs["verdict"] if vs else "-"
-        pdelta = _primary_delta_summary(g, vs)
-        print(f"{r.id:<22} {r.status:<8} {ctrl_s:<11} {verd_s:<15} {pdelta:<20} {r.title[:44]}")
+    return filtered
 
 
-def cmd_analyses(
+def _filter_analyses(
     g: ContourGraph,
     *,
     kind: str | None = None,
@@ -803,8 +622,7 @@ def cmd_analyses(
     goal_id: str | None = None,
     status: str | None = None,
     control: str | None = None,
-    as_json: bool = False,
-) -> None:
+) -> list[tuple[ContourNode, str]]:
     allowed: set[str] | None = None
     if goal_id:
         gid = strip_wiki(goal_id)
@@ -843,41 +661,158 @@ def cmd_analyses(
         if control and ctrl != control:
             continue
         filtered.append((a, ctrl))
+    return filtered
+
+
+def cmd_ls(
+    g: ContourGraph,
+    *,
+    target: str | None = None,  # None ("all") | "runs" | "analyses"
+    tree: bool = False,
+    goal_id: str | None = None,
+    claim_id: str | None = None,
+    eval_scope: str | None = None,
+    kind: str | None = None,
+    subject: str | None = None,
+    status: str | None = None,
+    control: str | None = None,
+    verdict: str | None = None,
+    as_json: bool = False,
+) -> None:
+    show_runs = target in (None, "runs") and not (kind or subject)
+    show_analyses = target in (None, "analyses") and not (tree or eval_scope or verdict)
+
+    runs_list = (
+        _filter_runs(
+            g,
+            goal_id=goal_id,
+            claim_id=claim_id,
+            eval_scope=eval_scope,
+            status=status,
+            control=control,
+            verdict=verdict,
+        )
+        if show_runs
+        else []
+    )
+    analyses_list = (
+        _filter_analyses(
+            g,
+            kind=kind,
+            subject=subject,
+            claim_id=claim_id,
+            goal_id=goal_id,
+            status=status,
+            control=control,
+        )
+        if show_analyses
+        else []
+    )
 
     if as_json:
-        _emit_json({
-            "count": len(filtered),
-            "analyses": [
-                {
-                    "id": a.id,
-                    "kind": a.kind,
-                    "title": a.title,
-                    "status": a.status,
-                    "bugged": a.bugged,
-                    "control_level": ctrl,
-                    "subjects": a.subjects,
-                    "script": a.script,
-                    "script_sha256": a.script_sha256,
-                    "launch_cmd": a.get("launch_cmd"),
-                    "metrics": a.metrics,
-                    "artifacts": a.artifacts,
-                    "tldr": a.tldr,
-                }
-                for a, ctrl in filtered
-            ],
-        })
+        runs_ser = [
+            {
+                "id": r.id,
+                "title": r.title,
+                "status": r.status,
+                "bugged": r.bugged,
+                "gpu_hours": r.gpu_hours,
+                "parent": r.parent,
+                "control_level": vs["control_level"] if vs else evidence_control_level(g, r),
+                "verdict": vs["verdict"] if vs else None,
+                "flags": vs.get("flags", []) if vs else [],
+                "primary_delta": _primary_delta_summary(g, vs),
+            }
+            for r, vs in runs_list
+        ]
+        anas_ser = [
+            {
+                "id": a.id,
+                "kind": a.kind,
+                "title": a.title,
+                "status": a.status,
+                "bugged": a.bugged,
+                "control_level": ctrl,
+                "subjects": a.subjects,
+                "script": a.script,
+                "script_sha256": a.script_sha256,
+                "script_tracked": a.script_tracked,
+                "launch_cmd": a.get("launch_cmd"),
+                "metrics": a.metrics,
+                "artifacts": a.artifacts,
+                "tldr": a.tldr,
+            }
+            for a, ctrl in analyses_list
+        ]
+        out: dict[str, Any] = {}
+        if show_runs and not show_analyses:
+            out = {"count": len(runs_ser), "runs": runs_ser}
+        elif show_analyses and not show_runs:
+            out = {"count": len(anas_ser), "analyses": anas_ser}
+        else:
+            out = {
+                "counts": {"runs": len(runs_ser), "analyses": len(anas_ser)},
+                "runs": runs_ser,
+                "analyses": anas_ser,
+            }
+        _emit_json(out)
         return
 
-    if not filtered:
-        print("No matching analyses found.")
-        return
+    printed_any = False
+    if show_runs:
+        if runs_list:
+            printed_any = True
+            if tree:
+                print("=== CONTOUR RUN LINEAGE TREE ===")
+                by_id = {r.id: (r, vs) for r, vs in runs_list}
+                children: dict[str, list[str]] = {}
+                roots: list[str] = []
+                for r, _ in runs_list:
+                    p = r.parent
+                    if p and p in by_id:
+                        children.setdefault(p, []).append(r.id)
+                    else:
+                        roots.append(r.id)
 
-    print(f"=== CONTOUR ANALYSES & EVALS ({len(filtered)}) ===")
-    print(f"{'ID':<22} {'KIND':<9} {'STATUS':<8} {'CONTROL':<11} {'SUBJECTS':<28} {'TITLE'}")
-    print("-" * 116)
-    for a, ctrl in filtered:
-        subj_s = ", ".join(a.subjects) if a.subjects else "-"
-        print(f"{a.id:<22} {a.kind:<9} {a.status:<8} {ctrl:<11} {subj_s[:26]:<28} {a.title[:44]}")
+                def _print_branch(rid: str, prefix: str = "", is_last: bool = True, is_root: bool = True) -> None:
+                    r, vs = by_id[rid]
+                    if vs:
+                        fl = f" !{','.join(vs['flags'])}" if vs.get("flags") else ""
+                        badge = f"[{vs['control_level']}/{vs['verdict']} {_primary_delta_summary(g, vs)}{fl}]"
+                    else:
+                        badge = f"[{r.status} | root]"
+                    conn = "" if is_root else ("└── " if is_last else "├── ")
+                    print(f"{prefix}{conn}{r.id} {badge} :: {r.title}")
+                    kids = children.get(rid, [])
+                    child_prefix = "" if is_root else (prefix + ("    " if is_last else "│   "))
+                    for idx, kid in enumerate(kids):
+                        _print_branch(kid, child_prefix, idx == len(kids) - 1, is_root=False)
+
+                for root_id in roots:
+                    _print_branch(root_id)
+            else:
+                print(f"=== CONTOUR RUNS ({len(runs_list)}) ===")
+                print(f"{'ID':<22} {'STATUS':<8} {'CONTROL':<11} {'VERDICT':<15} {'PRIMARY Δ':<20} {'TITLE'}")
+                print("-" * 116)
+                for r, vs in runs_list:
+                    ctrl_s = vs["control_level"] if vs else evidence_control_level(g, r)
+                    verd_s = vs["verdict"] if vs else "-"
+                    pdelta = _primary_delta_summary(g, vs)
+                    print(f"{r.id:<22} {r.status:<8} {ctrl_s:<11} {verd_s:<15} {pdelta:<20} {r.title[:44]}")
+
+    if show_analyses and analyses_list:
+        if printed_any:
+            print()
+        printed_any = True
+        print(f"=== CONTOUR ANALYSES & EVALS ({len(analyses_list)}) ===")
+        print(f"{'ID':<22} {'KIND':<9} {'STATUS':<8} {'CONTROL':<11} {'SUBJECTS':<28} {'TITLE'}")
+        print("-" * 116)
+        for a, ctrl in analyses_list:
+            subj_s = ", ".join(a.subjects) if a.subjects else "-"
+            print(f"{a.id:<22} {a.kind:<9} {a.status:<8} {ctrl:<11} {subj_s[:26]:<28} {a.title[:44]}")
+
+    if not printed_any:
+        print("No matching runs or analyses found.")
 
 
 def cmd_compare(g: ContourGraph, ctrl_id: str, treat_id: str, as_json: bool = False) -> None:
@@ -1008,12 +943,18 @@ def cmd_brief(g: ContourGraph, goal_id: str | None = None, as_json: bool = False
         _emit_json(brief)
         return
 
+    c = brief["counts"]
     h = brief["health"]
     aw = brief["active_work"]
     rev = brief["review"]
     ot = brief["open_threads"]
     print("=== CONTOUR MORNING BRIEF ===")
-    print(f"Health: {h['total_issues']} issue(s) ({h['errors']} error, {h['warnings']} warn)")
+    print(
+        f"State:  {c['goals']} Goal(s) | {c['claims']} Claim(s) | "
+        f"{c['runs']} Run(s) ({c['usable_runs']} usable) | "
+        f"{c['analyses']} Analysis/Eval(s) ({c['usable_analyses']} usable)"
+    )
+    print(f"Health: {h['total_issues']} issue(s) ({h['errors']} error, {h['warnings']} warn) | review={c['review_items']}")
 
     print("\n[1. Active & Unsynthesized Work]")
     if aw["running_runs"] or aw["running_analyses"]:
@@ -1024,41 +965,50 @@ def cmd_brief(g: ContourGraph, goal_id: str | None = None, as_json: bool = False
             print(f"  * RUNNING {a['kind']} {a['id']}: {a['title']}")
     if aw["stuck"]:
         for s in aw["stuck"]:
-            print(f"  * STUCK ({s['node']}): {s['message']}")
+            print(f"  * [{s['rule']}] ({s['node']}): {s['message']}")
     if aw["unsynthesized"]:
         for u in aw["unsynthesized"]:
-            print(f"  * [{u['code']}] ({u['node']}): {u['message']}")
+            print(f"  * [{u['rule']}] ({u['node']}): {u['message']}")
     if not (aw["running_runs"] or aw["running_analyses"] or aw["stuck"] or aw["unsynthesized"]):
         print("  (None)")
 
-    rev_total = len(rev["awaiting_signoff"]) + len(rev["stale_verified"]) + len(rev["dirty_frontier"])
+    rev_total = c["review_items"]
     print(f"\n[2. Human Review Queue] ({rev_total})")
-    for c in rev["awaiting_signoff"]:
-        print(f"  * Sign-off: {c['id']} [{c['status']}]: {c['title']}")
-    for c in rev["stale_verified"]:
-        print(f"  * Stale:    {c['id']} [{c['status']} | was {c['stored_verification']}]: {c['title']}")
+    for item in rev["awaiting_signoff"]:
+        print(f"  * Sign-off: {item['id']} [{item['status']}]: {item['title']}")
+        if item.get("audit_note"):
+            print(f"    audit_note: {item['audit_note']}")
+    for item in rev["stale_verified"]:
+        flag = " [CONTRADICTED]" if item["has_contradicts"] else ""
+        print(f"  * Stale:    {item['id']} [{item['status']} | was {item['stored_verification']}]{flag}: {item['title']}")
     for r in rev["dirty_frontier"]:
-        print(f"  * Dirty frontier: {r['id']} ({r['metric']}={r['value']})")
+        print(f"  * Dirty frontier: {r['id']} ({r['metric']}={r['value']} @ {r['gpu_hours']}h)")
     if rev_total == 0:
         print("  (Clear)")
 
-    print("\n[3. Open Questions & Claim Threads]")
+    print("\n[3. Goals, Claims & Open Questions]")
+    for goal in brief["goals"]:
+        print(f"  [GOAL] {goal['id']} ({goal['status'].upper()}): {goal['title']}")
+        for clm in goal["claims"]:
+            cnt = clm["counts"]
+            print(
+                f"    └── {clm['id']} [{clm['status']} | {clm['verification']}] "
+                f"(+{cnt['supports']} -{cnt['contradicts']} ~{cnt['qualifies']}): {clm['title']}"
+            )
+    for clm in brief["unassigned_claims"]:
+        cnt = clm["counts"]
+        print(
+            f"  [CLAIM] {clm['id']} [{clm['status']} | {clm['verification']}] "
+            f"(+{cnt['supports']} -{cnt['contradicts']} ~{cnt['qualifies']}): {clm['title']}"
+        )
     for q in ot["open_questions"]:
         print(f"  ? ({q['goal']}) {q['question']}")
-    for ct in ot["claim_threads"]:
-        extras = []
-        if ct["contradicts"]:
-            extras.append(f"contradicts={len(ct['contradicts'])}")
-        if ct["qualifies"]:
-            extras.append(f"qualifies={len(ct['qualifies'])}")
-        extra_s = f" ({', '.join(extras)})" if extras else ""
-        print(f"  * {ct['id']} [{ct['status']} | {ct['verification']}]{extra_s}: {ct['title']}")
-    if not (ot["open_questions"] or ot["claim_threads"]):
+    if not (brief["goals"] or brief["unassigned_claims"] or ot["open_questions"]):
         print("  (None)")
 
     ide = brief["ideate"]
     counts = {k: len(v) for k, v in ide.items() if v}
-    print("\n[4. Ideation Highlights]")
+    print("\n[4. Ideation Highlights] (run `contour ideate` for full details)")
     if counts:
         print("  " + " | ".join(f"{k}={n}" for k, n in counts.items()))
     else:
@@ -1134,6 +1084,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", dest="as_json", action="store_true", help="Emit machine-readable JSON")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    # Transitions
     p_init = sub.add_parser("init", parents=[common], help="Initialize a Contour root")
     p_init.add_argument("path", nargs="?", type=Path, default=None, help="Target directory (default: ./contour)")
     p_init.add_argument("--with-skill", action="store_true", help="Write .agent/skills/contour-research/SKILL.md")
@@ -1149,9 +1100,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_link.add_argument("claim_id", type=str)
     p_link.add_argument("--as", dest="relation", choices=list(EDGE_KEYS), default=None)
 
-    p_check = sub.add_parser("check", parents=[common], help="Evaluate Tier-1 & Tier-2 mechanical invariants")
-    p_check.add_argument("--strict", action="store_true", help="Exit non-zero on WARN")
-
     p_verify = sub.add_parser("verify", parents=[common], help="Record agentic or human verification on a claim")
     p_verify.add_argument("claim_id", type=str)
     grp = p_verify.add_mutually_exclusive_group(required=True)
@@ -1159,28 +1107,24 @@ def build_parser() -> argparse.ArgumentParser:
     grp.add_argument("--human", action="store_true")
     p_verify.add_argument("--note", type=str, default=None)
 
-    sub.add_parser("review", parents=[common], help="Tier-3 selective human verification inbox")
-    sub.add_parser("status", parents=[common], help="Overview of Goals -> Claims -> Evidence counts")
+    # Observables
+    p_brief = sub.add_parser("brief", parents=[common], help="Morning cockpit: status, live jobs, review queue, open questions")
+    p_brief.add_argument("--goal", dest="goal_id", type=str, default=None)
+
+    p_ls = sub.add_parser("ls", parents=[common], help="List runs and/or analyses (or render run lineage tree)")
+    p_ls.add_argument("target", nargs="?", choices=["runs", "analyses"], default=None)
+    p_ls.add_argument("--tree", action="store_true")
+    p_ls.add_argument("--goal", dest="goal_id", type=str, default=None)
+    p_ls.add_argument("--claim", dest="claim_id", type=str, default=None)
+    p_ls.add_argument("--eval", dest="eval_scope", type=str, default=None)
+    p_ls.add_argument("--kind", choices=list(ANALYSIS_KINDS), default=None)
+    p_ls.add_argument("--subject", type=str, default=None)
+    p_ls.add_argument("--status", type=str, default=None)
+    p_ls.add_argument("--control", type=str, default=None)
+    p_ls.add_argument("--verdict", type=str, default=None)
 
     p_show = sub.add_parser("show", parents=[common], aliases=["inspect"], help="Inspect a Goal, Claim, Run, or Analysis")
     p_show.add_argument("node_id", type=str)
-
-    p_runs = sub.add_parser("runs", parents=[common], help="Filter and tabulate training runs or render lineage tree")
-    p_runs.add_argument("--tree", action="store_true")
-    p_runs.add_argument("--goal", dest="goal_id", type=str, default=None)
-    p_runs.add_argument("--claim", dest="claim_id", type=str, default=None)
-    p_runs.add_argument("--eval", dest="eval_scope", type=str, default=None)
-    p_runs.add_argument("--status", type=str, default=None)
-    p_runs.add_argument("--control", type=str, default=None)
-    p_runs.add_argument("--verdict", type=str, default=None)
-
-    p_ana = sub.add_parser("analyses", parents=[common], help="Filter and tabulate post-hoc evals and analyses")
-    p_ana.add_argument("--kind", choices=list(ANALYSIS_KINDS), default=None)
-    p_ana.add_argument("--subject", type=str, default=None)
-    p_ana.add_argument("--claim", dest="claim_id", type=str, default=None)
-    p_ana.add_argument("--goal", dest="goal_id", type=str, default=None)
-    p_ana.add_argument("--status", type=str, default=None)
-    p_ana.add_argument("--control", type=str, default=None)
 
     p_cmp = sub.add_parser("compare", parents=[common], help="Ad-hoc comparison between two runs (composing attached evals)")
     p_cmp.add_argument("ctrl_id", type=str)
@@ -1189,11 +1133,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_front = sub.add_parser("frontier", parents=[common], help="Primary metric vs GPU-hours Pareto frontier")
     p_front.add_argument("--metric", type=str, default=None)
 
+    p_check = sub.add_parser("check", parents=[common], help="Evaluate Tier-1 & Tier-2 mechanical invariants")
+    p_check.add_argument("--strict", action="store_true", help="Exit non-zero on WARN")
+
     p_ideate = sub.add_parser("ideate", parents=[common], help="Propose next experiments from state diffs, tensions, and open questions")
     p_ideate.add_argument("--goal", dest="goal_id", type=str, default=None)
-
-    p_brief = sub.add_parser("brief", parents=[common], help="Morning startup briefing on live runs, review inbox, and open threads")
-    p_brief.add_argument("--goal", dest="goal_id", type=str, default=None)
 
     p_rep = sub.add_parser("report", parents=[common], help="Generate an evidence-grounded truth bundle for sharing results")
     p_rep.add_argument("--goal", dest="goal_id", type=str, default=None)
@@ -1201,7 +1145,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep.add_argument("--runs", dest="run_ids", nargs="+", default=None)
     p_rep.add_argument("--analyses", dest="analysis_ids", nargs="+", default=None)
     p_rep.add_argument("--out", dest="out_dir", type=Path, default=None, help="Export report.md + copied local assets to directory")
-    p_rep.add_argument("--strict", action="store_true", help="Exit non-zero if any cited item is unverified, stale, dirty, or preliminary")
+    p_rep.add_argument("--strict", action="store_true", help="Exit non-zero if any load-bearing item is unverified, stale, dirty, or preliminary")
 
     return parser
 
@@ -1225,48 +1169,36 @@ def main(argv: list[str] | None = None) -> None:
         cmd_new(g, args.node_type, args.slug, args.title, kind=args.kind, as_json=args.as_json)
     elif args.cmd == "link":
         cmd_link(g, args.evidence_id, args.claim_id, relation=args.relation, as_json=args.as_json)
-    elif args.cmd == "check":
-        cmd_check(g, strict=args.strict, as_json=args.as_json)
     elif args.cmd == "verify":
         mode = "agent" if args.agent else "human"
         cmd_verify(g, args.claim_id, mode=mode, note=args.note, as_json=args.as_json)
-    elif args.cmd == "review":
-        cmd_review(g, as_json=args.as_json)
-    elif args.cmd == "status":
-        cmd_status(g, as_json=args.as_json)
-    elif args.cmd in ("show", "inspect"):
-        cmd_show(g, args.node_id, as_json=args.as_json)
-    elif args.cmd == "runs":
-        cmd_runs(
+    elif args.cmd == "brief":
+        cmd_brief(g, goal_id=args.goal_id, as_json=args.as_json)
+    elif args.cmd == "ls":
+        cmd_ls(
             g,
+            target=args.target,
             tree=args.tree,
             goal_id=args.goal_id,
             claim_id=args.claim_id,
             eval_scope=args.eval_scope,
+            kind=args.kind,
+            subject=args.subject,
             status=args.status,
             control=args.control,
             verdict=args.verdict,
             as_json=args.as_json,
         )
-    elif args.cmd == "analyses":
-        cmd_analyses(
-            g,
-            kind=args.kind,
-            subject=args.subject,
-            claim_id=args.claim_id,
-            goal_id=args.goal_id,
-            status=args.status,
-            control=args.control,
-            as_json=args.as_json,
-        )
+    elif args.cmd in ("show", "inspect"):
+        cmd_show(g, args.node_id, as_json=args.as_json)
     elif args.cmd == "compare":
         cmd_compare(g, args.ctrl_id, args.treat_id, as_json=args.as_json)
     elif args.cmd == "frontier":
         cmd_frontier(g, metric=args.metric, as_json=args.as_json)
+    elif args.cmd == "check":
+        cmd_check(g, strict=args.strict, as_json=args.as_json)
     elif args.cmd == "ideate":
         cmd_ideate(g, goal_id=args.goal_id, as_json=args.as_json)
-    elif args.cmd == "brief":
-        cmd_brief(g, goal_id=args.goal_id, as_json=args.as_json)
     elif args.cmd == "report":
         cmd_report(
             g,

@@ -34,14 +34,10 @@ class TestAnalysesBriefReport(unittest.TestCase):
             main(["--root", str(self.root), "--json", *argv])
         return json.loads(buf.getvalue())
 
-    def test_analyses_cli_brief_and_report_with_asset_export(self) -> None:
-        # Goal with `## Open Questions` in Markdown body (lean 2-key YAML!)
+    def test_analyses_ls_brief_and_report_with_asset_export(self) -> None:
         write_markdown_file(
             self.root / "goals" / "goal_enc.md",
-            {
-                "title": "Better Vision Encoder",
-                "status": "active",
-            },
+            {"title": "Better Vision Encoder", "status": "active"},
             "## Objective & Success Criteria\nImprove accuracy by >=1%.\n\n"
             "## Current Synthesis\n- SigLIP-B looks promising.\n\n"
             "## Open Questions\n"
@@ -88,6 +84,7 @@ class TestAnalysesBriefReport(unittest.TestCase):
         script_path = self.root / "analyses" / "scripts" / "check_sizes.py"
         script_path.write_text("print('checking sizes')\n")
 
+        # Ad-hoc untracked script -> exploratory -> fine in `qualifies`, does NOT block `report --strict`!
         ana = Analysis(
             title="Object-size error breakdown",
             subjects=[r1.id, r2.id],
@@ -116,18 +113,18 @@ class TestAnalysesBriefReport(unittest.TestCase):
                 "qualifies": [],
             },
             f"## Hypothesis & Mechanism\nBetter pretraining.\n\n## Evidence Synthesis\n"
-            f"- **Holds:** [[{r2.id}]] gains +2.2%; [[{ana.id}]] confirms small-object gains.\n"
+            f"- **Holds:** [[{r2.id}]] gains +2.2%; ad-hoc probe [[{ana.id}]] shows small-object gains.\n"
             f"- **Untested / Caveats:** Dense segmentation not yet evaluated.\n",
         )
 
+        # Ad-hoc untracked analysis links under `qualifies` by default
         link_ana_default = self._run_json(["link", ana.id, "clm_siglip"])
         self.assertEqual(link_ana_default["relation"], "qualifies")
-        link_ana_sup = self._run_json(["link", ana.id, "clm_siglip", "--as", "supports"])
-        self.assertEqual(link_ana_sup["relation"], "supports")
+        self.assertEqual(link_ana_default["control_level"], "exploratory")
         link_run = self._run_json(["link", r2.id, "clm_siglip"])
         self.assertEqual(link_run["relation"], "supports")
 
-        anas_out = self._run_json(["analyses", "--kind", "analysis", "--subject", r2.id])
+        anas_out = self._run_json(["ls", "analyses", "--kind", "analysis", "--subject", r2.id])
         self.assertEqual(anas_out["count"], 1)
         self.assertEqual(anas_out["analyses"][0]["id"], ana.id)
 
@@ -142,10 +139,12 @@ class TestAnalysesBriefReport(unittest.TestCase):
             "Does SigLIP beat ResNet on small objects?",
         )
 
+        # `report --strict` fails while claim is `draft`
         with self.assertRaises(SystemExit) as ctx:
             self._run_json(["report", "--goal", "goal_enc", "--strict"])
         self.assertEqual(ctx.exception.code, 1)
 
+        # Verify claim -> `report --strict` passes (exploratory `qualifies` carries no verification weight!)
         main(["--root", str(self.root), "verify", "clm_siglip", "--human", "--note", "Clean swap"])
         export_dir = self.root / "exported_report"
         rep = self._run_json(["report", "--goal", "goal_enc", "--strict", "--out", str(export_dir)])

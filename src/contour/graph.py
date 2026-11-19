@@ -195,6 +195,10 @@ class ContourNode:
         return str(val) if val else None
 
     @property
+    def script_tracked(self) -> bool:
+        return bool(self.frontmatter.get("script_tracked", False))
+
+    @property
     def tldr(self) -> str:
         if "tldr" in self.frontmatter:
             return str(self.frontmatter["tldr"]).strip()

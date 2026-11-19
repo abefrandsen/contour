@@ -9,7 +9,7 @@ import yaml
 
 from contour import Analysis, Eval, Run
 from contour.cli import main
-from contour.compare import get_fresh_vs_parent
+from contour.compare import compute_analysis_control_level, get_fresh_vs_parent
 from contour.graph import ContourGraph
 from contour.mdio import parse_markdown_file, write_markdown_file
 from contour.run_logger import _get_git_info, ingest_record
@@ -46,7 +46,6 @@ class TestRunLogger(unittest.TestCase):
             self.assertEqual(fm_b["status"], "final")
             self.assertEqual(fm_b["metrics"]["val/loss"], 3.0)
             self.assertEqual(fm_b["config_path"], f"runs/configs/{base.id}.yaml")
-            # Path = identity; no redundant id/type/bugged/vs_parent/config in YAML
             for omitted in ("id", "type", "bugged", "config", "vs_parent"):
                 self.assertNotIn(omitted, fm_b)
             self.assertTrue((root / fm_b["config_path"]).exists())
@@ -76,50 +75,70 @@ class TestRunLogger(unittest.TestCase):
             self.assertEqual(vs["verdict"], "win")
             self.assertIn("optim.lr", vs["config_diff"])
 
-    def test_analysis_and_eval_logger_script_hash_and_launch_cmd(self) -> None:
+    def test_dirty_check_excludes_contour_dir_and_tracks_analysis_scripts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            main(["init", str(root)])
-            script_file = root / "analyses" / "scripts" / "probe_svd.py"
-            script_file.write_text("print('svd probe')\n", encoding="utf-8")
+            repo = Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "a@b.c"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True)
+            croot = repo / "contour"
+            main(["init", str(croot)])
+            (repo / "train.py").write_text("x = 1\n")
+            (repo / "scripts").mkdir()
+            tracked_script = repo / "scripts" / "eval_ood.py"
+            tracked_script.write_text("print('tracked eval')\n")
+            subprocess.run(
+                ["git", "add", "train.py", "scripts/eval_ood.py", "contour/contour.yaml", "contour/.gitignore"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
 
-            with Run(title="Base", root=root, git_cwd=root) as base:
-                base.track(80.0, "acc", context={"subset": "val"})
+            # Run 1 writes uncommitted files inside contour/runs/
+            with Run(title="Run 1", config={"lr": 1e-3}, root=croot, git_cwd=repo) as r1:
+                r1.track(80.0, "acc", context={"subset": "val"})
+            self.assertFalse(r1.code["dirty"])
 
+            # Run 2 runs right after Run 1 without committing contour/ -> MUST still be code.dirty == False!
+            with Run(title="Run 2", parent=r1.id, config={"lr": 2e-3}, root=croot, git_cwd=repo) as r2:
+                r2.track(81.0, "acc", context={"subset": "val"})
+            self.assertFalse(r2.code["dirty"])
+
+            # Ad-hoc gitignored analysis script -> script_tracked=False -> exploratory!
+            adhoc_script = croot / "analyses" / "scripts" / "adhoc.py"
+            adhoc_script.write_text("print('adhoc')\n")
             with Analysis(
-                title="SVD Spectrum Probe",
-                subjects=[base.id],
-                script=script_file,
-                launch_cmd="python analyses/scripts/probe_svd.py",
-                root=root,
-                git_cwd=root,
-            ) as ana:
-                ana.track(38.4, "eff_rank", context={"subset": "svd"})
-                ana.add_artifact("analyses/artifacts/svd.png", kind="plot", note="Layer decay")
+                title="Adhoc probe",
+                subjects=[r1.id],
+                script=adhoc_script,
+                root=croot,
+                git_cwd=repo,
+            ) as ana_adhoc:
+                ana_adhoc.track(12.3, "rank", context={"subset": "svd"})
+            fm_adhoc, _ = parse_markdown_file(ana_adhoc.path)
+            self.assertFalse(fm_adhoc["script_tracked"])
 
-            fm_a, _ = parse_markdown_file(ana.path)
-            self.assertEqual(fm_a["kind"], "analysis")
-            self.assertEqual(fm_a["status"], "final")
-            self.assertEqual(fm_a["script"], "analyses/scripts/probe_svd.py")
-            self.assertTrue(fm_a["script_sha256"] and len(fm_a["script_sha256"]) == 16)
-            self.assertEqual(fm_a["launch_cmd"], "python analyses/scripts/probe_svd.py")
-            for omitted in ("id", "type", "bugged", "config", "config_path", "compute"):
-                self.assertNotIn(omitted, fm_a)
-            self.assertEqual(fm_a["metrics"]["svd/eff_rank"], 38.4)
-
+            # Tracked clean script -> script_tracked=True -> clean!
             with Eval(
-                title="Full OOD Eval",
-                subjects=[base.id],
-                script=script_file,
-                launch_cmd="python eval.py --ckpt base --split ood",
-                root=root,
-                git_cwd=root,
-            ) as ev:
-                ev.track(71.5, "acc", context={"subset": "ood"})
+                title="Tracked eval",
+                subjects=[r1.id],
+                script=tracked_script,
+                launch_cmd="python scripts/eval_ood.py --ckpt r1",
+                root=croot,
+                git_cwd=repo,
+            ) as ev_tracked:
+                ev_tracked.track(71.5, "acc", context={"subset": "ood"})
+            fm_ev, _ = parse_markdown_file(ev_tracked.path)
+            self.assertTrue(fm_ev["script_tracked"])
 
-            fm_e, _ = parse_markdown_file(ev.path)
-            self.assertEqual(fm_e["kind"], "eval")
-            self.assertEqual(fm_e["launch_cmd"], "python eval.py --ckpt base --split ood")
+            g = ContourGraph(croot)
+            self.assertEqual(compute_analysis_control_level(g, g.analyses[ana_adhoc.id]), "exploratory")
+            self.assertEqual(compute_analysis_control_level(g, g.analyses[ev_tracked.id]), "clean")
+
+            # Editing actual source code outside contour/ DOES mark dirty
+            (repo / "train.py").write_text("x = 2\n")
+            dirty_info = _get_git_info(repo, contour_root=croot)
+            self.assertTrue(dirty_info["dirty"])
 
     def test_exception_marks_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -141,27 +160,6 @@ class TestRunLogger(unittest.TestCase):
                     self.assertFalse(r.enabled)
                     self.assertIsNone(r.path)
             self.assertEqual(list((root / "runs").glob("*.md")), [])
-
-    def test_git_dirty_detection_and_gitignored_analysis_scripts(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-            subprocess.run(["git", "config", "user.email", "a@b.c"], cwd=repo, check=True)
-            subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True)
-            main(["init", str(repo)])
-            (repo / "train.py").write_text("x = 1\n")
-            subprocess.run(["git", "add", "train.py", "contour.yaml", ".gitignore"], cwd=repo, check=True)
-            subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
-
-            (repo / "analyses" / "scripts" / "adhoc.py").write_text("print(1)\n")
-            (repo / "analyses" / "artifacts" / "plot.png").write_bytes(b"PNG")
-            clean_info = _get_git_info(repo)
-            self.assertFalse(clean_info["dirty"])
-            self.assertTrue(clean_info["commit"])
-
-            (repo / "untracked.py").write_text("y = 2\n")
-            dirty_info = _get_git_info(repo)
-            self.assertTrue(dirty_info["dirty"])
 
     def test_to_record_and_ingest_record_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

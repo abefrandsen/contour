@@ -9,6 +9,9 @@ from typing import Any
 
 from .check import (
     ERROR,
+    RULE_STUCK_JOB,
+    RULE_TODO_PLACEHOLDER,
+    RULE_UNSYNTHESIZED_EVIDENCE,
     compute_verified_hash,
     effective_verification,
     evidence_control_level,
@@ -28,12 +31,12 @@ def _utc_now_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Morning Startup Briefing (`contour brief`)
+# Morning Startup Briefing (`contour brief`) — subsumes status & review
 # ---------------------------------------------------------------------------
 
 
 def build_brief(g: ContourGraph, *, goal_id: str | None = None) -> dict[str, Any]:
-    """Assemble a single high-signal morning startup snapshot of live research state."""
+    """Assemble the complete morning cockpit: counts, status tree, active work, review queue, open questions."""
     gid = strip_wiki(goal_id) if goal_id else None
     issues = find_check_issues(g)
     review = find_review_items(g)
@@ -53,6 +56,44 @@ def build_brief(g: ContourGraph, *, goal_id: str | None = None) -> dict[str, Any
             "stale_verified": [c for c in review["stale_verified"] if c["id"] in target_claim_ids],
             "dirty_frontier": review["dirty_frontier"],
         }
+
+    # Goal -> Claim status tree (formerly `contour status`)
+    covered_claims: set[str] = set()
+    goals_tree: list[dict[str, Any]] = []
+    for goal in target_goals:
+        g_claims = g.goal_claims(goal.id)
+        claim_list = []
+        for c in g_claims:
+            covered_claims.add(c.id)
+            edges = g.claim_edges(c)
+            claim_list.append({
+                "id": c.id,
+                "status": c.status,
+                "verification": effective_verification(g, c),
+                "stored_verification": c.verification,
+                "title": c.title,
+                "counts": {k: len(v) for k, v in edges.items()},
+            })
+        goals_tree.append({
+            "id": goal.id,
+            "status": goal.status,
+            "title": goal.title,
+            "tldr": goal.tldr,
+            "open_questions": goal.open_questions,
+            "claims": claim_list,
+        })
+
+    unassigned_claims = [
+        {
+            "id": c.id,
+            "status": c.status,
+            "verification": effective_verification(g, c),
+            "title": c.title,
+            "counts": {k: len(v) for k, v in g.claim_edges(c).items()},
+        }
+        for c in target_claims
+        if c.id not in covered_claims
+    ]
 
     running_runs = [
         {
@@ -77,8 +118,10 @@ def build_brief(g: ContourGraph, *, goal_id: str | None = None) -> dict[str, Any
         if a.status == "running"
     ]
 
-    stuck = [i.as_dict() for i in issues if i.code == "C005"]
-    unsynthesized = [i.as_dict() for i in issues if i.code in ("C003", "C004")]
+    stuck = [i.as_dict() for i in issues if i.code == RULE_STUCK_JOB]
+    unsynthesized = [
+        i.as_dict() for i in issues if i.code in (RULE_UNSYNTHESIZED_EVIDENCE, RULE_TODO_PLACEHOLDER)
+    ]
 
     open_questions: list[dict[str, str]] = []
     for goal in target_goals:
@@ -87,33 +130,33 @@ def build_brief(g: ContourGraph, *, goal_id: str | None = None) -> dict[str, Any
         for q in goal.open_questions:
             open_questions.append({"goal": goal.id, "question": q})
 
-    claim_threads: list[dict[str, Any]] = []
-    for c in target_claims:
-        if c.status not in ("active", "supported"):
-            continue
-        con = c.refs("contradicts")
-        qual = c.refs("qualifies")
-        if c.status == "active" or con or qual:
-            claim_threads.append({
-                "id": c.id,
-                "status": c.status,
-                "verification": effective_verification(g, c),
-                "title": c.title,
-                "contradicts": con,
-                "qualifies": qual,
-            })
-
-    by_code: dict[str, int] = {}
+    by_rule: dict[str, int] = {}
     for i in issues:
-        by_code[i.code] = by_code.get(i.code, 0) + 1
+        by_rule[i.code] = by_rule.get(i.code, 0) + 1
+
+    review_total = (
+        len(review["awaiting_signoff"])
+        + len(review["stale_verified"])
+        + len(review["dirty_frontier"])
+    )
 
     return {
         "goal_filter": gid,
+        "counts": {
+            "goals": len(g.goals),
+            "claims": len(g.claims),
+            "runs": len(g.runs),
+            "usable_runs": len(g.usable_runs()),
+            "analyses": len(g.analyses),
+            "usable_analyses": len(g.usable_analyses()),
+            "check_issues": len(issues),
+            "review_items": review_total,
+        },
         "health": {
             "total_issues": len(issues),
             "errors": sum(1 for i in issues if i.severity == ERROR),
             "warnings": sum(1 for i in issues if i.severity != ERROR),
-            "by_code": dict(sorted(by_code.items())),
+            "by_rule": dict(sorted(by_rule.items())),
         },
         "active_work": {
             "running_runs": running_runs,
@@ -122,9 +165,10 @@ def build_brief(g: ContourGraph, *, goal_id: str | None = None) -> dict[str, Any
             "unsynthesized": unsynthesized,
         },
         "review": review,
+        "goals": goals_tree,
+        "unassigned_claims": unassigned_claims,
         "open_threads": {
             "open_questions": open_questions,
-            "claim_threads": claim_threads,
         },
         "ideate": ideate,
     }
@@ -175,6 +219,7 @@ def _serialize_analysis_evidence(g: ContourGraph, ana: ContourNode) -> dict[str,
         "subjects": ana.subjects,
         "script": ana.script,
         "script_sha256": ana.script_sha256,
+        "script_tracked": ana.script_tracked,
         "launch_cmd": ana.get("launch_cmd"),
         "code": ana.code,
         "metrics": ana.metrics,
@@ -198,6 +243,8 @@ def build_report(
     included_goals: list[ContourNode] = []
     included_runs: dict[str, ContourNode] = {}
     included_analyses: dict[str, ContourNode] = {}
+    # Load-bearing evidence IDs (supports / contradicts, or preliminary targets)
+    load_bearing_ids: set[str] = set()
 
     if preliminary:
         for rid in (run_ids or []):
@@ -205,11 +252,13 @@ def build_report(
             if r_clean not in g.runs:
                 raise ValueError(f"Unknown run: {r_clean!r}")
             included_runs[r_clean] = g.runs[r_clean]
+            load_bearing_ids.add(r_clean)
         for aid in (analysis_ids or []):
             a_clean = strip_wiki(aid)
             if a_clean not in g.analyses:
                 raise ValueError(f"Unknown analysis: {a_clean!r}")
             included_analyses[a_clean] = g.analyses[a_clean]
+            load_bearing_ids.add(a_clean)
     else:
         if goal_id:
             gid = strip_wiki(goal_id)
@@ -233,6 +282,8 @@ def build_report(
         for c in included_claims:
             for edge in EDGE_KEYS:
                 for eid in c.refs(edge):
+                    if edge in ("supports", "contradicts"):
+                        load_bearing_ids.add(eid)
                     if eid in g.runs:
                         included_runs[eid] = g.runs[eid]
                     elif eid in g.analyses:
@@ -245,11 +296,13 @@ def build_report(
             if r_clean not in g.runs:
                 raise ValueError(f"Unknown run: {r_clean!r}")
             included_runs[r_clean] = g.runs[r_clean]
+            load_bearing_ids.add(r_clean)
         for aid in (analysis_ids or []):
             a_clean = strip_wiki(aid)
             if a_clean not in g.analyses:
                 raise ValueError(f"Unknown analysis: {a_clean!r}")
             included_analyses[a_clean] = g.analyses[a_clean]
+            load_bearing_ids.add(a_clean)
 
     claims_payload: list[dict[str, Any]] = []
     verif_counts = {"human_verified": 0, "agent_audited": 0, "draft": 0}
@@ -306,25 +359,21 @@ def build_report(
         if i.node in included_ids or bool(included_ids & set(i.related_nodes))
     ]
 
+    # Strict gate checks load-bearing evidence (`supports` / `contradicts`); `qualifies` carries no verification weight
     dirty_evidence: list[str] = []
     exploratory_evidence: list[str] = []
     invalid_evidence: list[str] = []
-    for r in included_runs.values():
-        if bool(r.code.get("dirty")):
-            dirty_evidence.append(r.id)
-        lvl = evidence_control_level(g, r)
+    for eid in sorted(load_bearing_ids):
+        ev = g.get_evidence(eid)
+        if ev is None:
+            continue
+        if bool(ev.code.get("dirty")):
+            dirty_evidence.append(ev.id)
+        lvl = evidence_control_level(g, ev)
         if lvl == "exploratory":
-            exploratory_evidence.append(r.id)
+            exploratory_evidence.append(ev.id)
         elif lvl == "invalid":
-            invalid_evidence.append(r.id)
-    for a in included_analyses.values():
-        if bool(a.code.get("dirty")):
-            dirty_evidence.append(a.id)
-        lvl = evidence_control_level(g, a)
-        if lvl == "exploratory":
-            exploratory_evidence.append(a.id)
-        elif lvl == "invalid":
-            invalid_evidence.append(a.id)
+            invalid_evidence.append(ev.id)
 
     warnings: list[str] = []
     if preliminary:
@@ -332,13 +381,13 @@ def build_report(
     if verif_counts["draft"] > 0:
         warnings.append(f"{verif_counts['draft']} included claim(s) are unverified (`draft`).")
     if stale_claims:
-        warnings.append(f"Stale verified claim(s) (C008): {', '.join(stale_claims)}.")
+        warnings.append(f"Stale verified claim(s) (`stale-verification`): {', '.join(stale_claims)}.")
     if dirty_evidence:
-        warnings.append(f"Uncommitted code (`code.dirty: true`) on: {', '.join(sorted(dirty_evidence))}.")
+        warnings.append(f"Uncommitted code (`code.dirty: true`) on load-bearing evidence: {', '.join(dirty_evidence)}.")
     if exploratory_evidence:
-        warnings.append(f"Exploratory evidence included: {', '.join(sorted(exploratory_evidence))}.")
+        warnings.append(f"Exploratory load-bearing evidence included: {', '.join(exploratory_evidence)}.")
     if invalid_evidence:
-        warnings.append(f"Invalid/quarantined evidence included: {', '.join(sorted(invalid_evidence))}.")
+        warnings.append(f"Invalid/quarantined load-bearing evidence included: {', '.join(invalid_evidence)}.")
     blocking_issues = [i for i in scoped_issues if i.severity == ERROR or i.category == "epistemic"]
     if blocking_issues:
         warnings.append(f"{len(blocking_issues)} error/epistemic check issue(s) apply to included items.")
@@ -382,9 +431,10 @@ def build_report(
             "dirty": bool(a.code.get("dirty", False)),
             "script": a.script,
             "script_sha256": a.script_sha256,
+            "script_tracked": a.script_tracked,
         })
 
-    git_info = _get_git_info(g.root)
+    git_info = _get_git_info(g.root, contour_root=g.root)
 
     return {
         "generated_at": _utc_now_iso(),
@@ -396,9 +446,9 @@ def build_report(
             "agent_audited": verif_counts["agent_audited"],
             "draft": verif_counts["draft"],
             "stale_claims": stale_claims,
-            "dirty_evidence": sorted(dirty_evidence),
-            "exploratory_evidence": sorted(exploratory_evidence),
-            "invalid_evidence": sorted(invalid_evidence),
+            "dirty_evidence": dirty_evidence,
+            "exploratory_evidence": exploratory_evidence,
+            "invalid_evidence": invalid_evidence,
             "open_issues": [i.as_dict() for i in scoped_issues],
             "warnings": warnings,
         },
@@ -473,7 +523,7 @@ def render_report_markdown(
             f"{integ['draft']} `draft`)"
         )
     lines.append(
-        f"- **Evidence hygiene:** {len(integ['stale_claims'])} stale | "
+        f"- **Evidence hygiene (load-bearing):** {len(integ['stale_claims'])} stale | "
         f"{len(integ['dirty_evidence'])} dirty | "
         f"{len(integ['exploratory_evidence'])} exploratory | "
         f"{len(integ['open_issues'])} check issue(s)"
@@ -603,7 +653,8 @@ def render_report_markdown(
                 detail = f"config={e.get('config_path') or 'inline'}, gpu_h={e.get('gpu_hours') or '-'}"
             else:
                 c_hash = f"`{e.get('commit') or '-'}`" + (" (dirty)" if e.get("dirty") else "")
-                detail = f"script={e.get('script') or '-'} (sha={e.get('script_sha256') or '-'})"
+                tr_s = "tracked" if e.get("script_tracked") else "untracked"
+                detail = f"script={e.get('script') or '-'} ({tr_s}, sha={e.get('script_sha256') or '-'})"
             lines.append(f"| `{e['id']}` | {e['type']} | {e['status']} | {c_hash} | {detail} |")
     lines.append("")
 

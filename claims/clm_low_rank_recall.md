@@ -3,7 +3,7 @@ title: Middle-block attention rank can be compressed to d/8 for global pooling, 
   degrades dense spatial recall
 status: supported
 verification: human_verified
-verified_hash: 686d9771
+verified_hash: 07fd4b16
 audit_note: Clean single-diff control (255694de vs 0012a98b); segmentation failure
   scoped.
 goals:

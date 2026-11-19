@@ -7,6 +7,15 @@ import yaml
 
 from contour.check import (
     ERROR,
+    RULE_MISSING_ARTIFACT,
+    RULE_OVERCLAIMED_STATUS,
+    RULE_SCHEMA_ERROR,
+    RULE_STALE_VERIFICATION,
+    RULE_STUCK_JOB,
+    RULE_TAINTED_EVIDENCE,
+    RULE_TODO_PLACEHOLDER,
+    RULE_UNDECLARED_METRIC,
+    RULE_UNSYNTHESIZED_EVIDENCE,
     WARN,
     compute_frontier,
     effective_verification,
@@ -70,6 +79,7 @@ def _write_analysis(
     bugged: bool = False,
     subjects: list[str] | None = None,
     motivated_by: list[str] | None = None,
+    script_tracked: bool = True,
     code: dict | None = None,
     metrics: dict | None = None,
     artifacts: list | None = None,
@@ -80,6 +90,8 @@ def _write_analysis(
         "title": f"Analysis {aid}",
         "status": status,
         "subjects": [f"[[{s}]]" for s in (subjects or [])],
+        "script": "scripts/probe.py" if script_tracked else "analyses/scripts/probe.py",
+        "script_tracked": script_tracked,
         "code": code or {"commit": "abc123", "dirty": False},
         "metrics": metrics or {},
     }
@@ -107,9 +119,9 @@ class TestConfigAndCheck(unittest.TestCase):
             "contour": 1,
             "metrics": {
                 "badkey": {"direction": "up", "kind": "quality"},
-                "val/loss": {"direction": "min", "kind": "quality"},  # missing min_delta & min_rel_delta
-                "sys/tput": {"direction": "max", "kind": "cost", "min_rel_delta": 0.05},  # ok!
-                "attn/entropy": {"direction": "max", "kind": "diagnostic"},  # ok without threshold
+                "val/loss": {"direction": "min", "kind": "quality"},
+                "sys/tput": {"direction": "max", "kind": "cost", "min_rel_delta": 0.05},
+                "attn/entropy": {"direction": "max", "kind": "diagnostic"},
             },
         })
         self.assertTrue(any("'<scope>/<name>'" in e for e in errs))
@@ -124,7 +136,7 @@ class TestConfigAndCheck(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_config(p)
 
-    def test_check_rules_c001_through_c010_and_sidecar_validation(self) -> None:
+    def test_named_check_rules_and_sidecar_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             main(["init", str(root)])
@@ -146,9 +158,7 @@ class TestConfigAndCheck(unittest.TestCase):
                 motivated_by=["clm_test"],
                 body="## Key Takeaway (TL;DR)\n- TODO: fill me in.\n",
             )
-            # Quarantined bugged run
             _write_run(root, "run_20261116_00000003", bugged=True, metrics={"val/loss": 2.5})
-            # Stuck running > 72h
             _write_run(
                 root,
                 "run_20261116_00000004",
@@ -174,19 +184,27 @@ class TestConfigAndCheck(unittest.TestCase):
             g = ContourGraph(root)
             now = dt.datetime(2026, 11, 18, 0, 0, tzinfo=dt.timezone.utc)
             issues = find_check_issues(g, now=now)
-            codes = {i.code for i in issues}
-            for expected in ("C001", "C002", "C003", "C004", "C005", "C007", "C009", "C010"):
-                self.assertIn(expected, codes)
-            self.assertNotIn("C006", codes)
+            rules = {i.code for i in issues}
+            for expected in (
+                RULE_SCHEMA_ERROR,
+                RULE_TAINTED_EVIDENCE,
+                RULE_UNSYNTHESIZED_EVIDENCE,
+                RULE_TODO_PLACEHOLDER,
+                RULE_STUCK_JOB,
+                RULE_OVERCLAIMED_STATUS,
+                RULE_UNDECLARED_METRIC,
+                RULE_MISSING_ARTIFACT,
+            ):
+                self.assertIn(expected, rules)
 
-            c010 = [i for i in issues if i.code == "C010"]
-            self.assertEqual(len(c010), 1)
-            self.assertEqual(c010[0].severity, WARN)
-            c001_cfg = [i for i in issues if i.code == "C001" and "config_path" in i.message]
-            self.assertEqual(len(c001_cfg), 1)
-            self.assertEqual(c001_cfg[0].severity, ERROR)
+            art_issues = [i for i in issues if i.code == RULE_MISSING_ARTIFACT]
+            self.assertEqual(len(art_issues), 1)
+            self.assertEqual(art_issues[0].severity, WARN)
+            cfg_issues = [i for i in issues if i.code == RULE_SCHEMA_ERROR and "config_path" in i.message]
+            self.assertEqual(len(cfg_issues), 1)
+            self.assertEqual(cfg_issues[0].severity, ERROR)
 
-    def test_c007_claim_semantics_neutral_standalone_analysis_and_contradicts(self) -> None:
+    def test_claim_semantics_untracked_script_downgrade_and_contradicts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             main(["init", str(root)])
@@ -197,21 +215,26 @@ class TestConfigAndCheck(unittest.TestCase):
                 },
             }))
             _write_run(root, "run_20261116_00000001", metrics={"val/loss": 3.0})
-            _write_run(
-                root,
-                "run_20261116_00000002",
-                parent="run_20261116_00000001",
-                metrics={"val/loss": 2.99},  # clean neutral
-            )
+            _write_run(root, "run_20261116_00000002", parent="run_20261116_00000001", metrics={"val/loss": 2.99})
             _write_analysis(
                 root,
                 "ana_20261117_00000001",
                 kind="analysis",
                 subjects=["run_20261116_00000001"],
-                metrics={"svd/eff_rank_layer6": 34.2},  # unregistered diagnostic -> no C009
+                script_tracked=True,
+                metrics={"svd/eff_rank_layer6": 34.2},
             )
-            _write_run(root, "run_20261116_00000003", metrics={"val/loss": 2.4})  # standalone clean run
+            _write_analysis(
+                root,
+                "ana_20261117_00000002",
+                kind="analysis",
+                subjects=["run_20261116_00000001"],
+                script_tracked=False,  # untracked script -> exploratory!
+                metrics={"svd/adhoc": 10.0},
+            )
+            _write_run(root, "run_20261116_00000003", metrics={"val/loss": 2.4})
 
+            # Tracked analysis + clean neutral + standalone run pass in supports; untracked analysis ok in qualifies!
             write_markdown_file(
                 root / "claims" / "clm_ok.md",
                 {
@@ -225,28 +248,25 @@ class TestConfigAndCheck(unittest.TestCase):
                         "[[run_20261116_00000003]]",
                     ],
                     "contradicts": [],
-                    "qualifies": [],
+                    "qualifies": ["[[ana_20261117_00000002]]"],
                 },
                 "## Hypothesis & Mechanism\nHolds.\n\n## Evidence Synthesis\n"
-                "- [[run_20261116_00000002]], [[ana_20261117_00000001]], [[run_20261116_00000003]].\n",
+                "- [[run_20261116_00000002]], [[ana_20261117_00000001]], [[run_20261116_00000003]], [[ana_20261117_00000002]].\n",
             )
             g = ContourGraph(root)
             self.assertEqual(find_check_issues(g), [])
 
-            # Unresolved contradiction on `supported` triggers C007
+            # Putting the untracked analysis in `supports` triggers `overclaimed-status`!
             fm, body = parse_markdown_file(root / "claims" / "clm_ok.md")
-            fm["contradicts"] = ["[[run_20261116_00000001]]"]
-            write_markdown_file(
-                root / "claims" / "clm_ok.md",
-                fm,
-                body + "- Contradicted by [[run_20261116_00000001]].\n",
-            )
+            fm["supports"].append("[[ana_20261117_00000002]]")
+            fm["qualifies"] = []
+            write_markdown_file(root / "claims" / "clm_ok.md", fm, body)
             g = ContourGraph(root)
-            c007 = [i for i in find_check_issues(g) if i.code == "C007"]
-            self.assertEqual(len(c007), 1)
-            self.assertIn("unresolved `contradicts`", c007[0].message)
+            oc = [i for i in find_check_issues(g) if i.code == RULE_OVERCLAIMED_STATUS]
+            self.assertEqual(len(oc), 1)
+            self.assertIn("exploratory", oc[0].message)
 
-    def test_taint_propagation_quarantine_and_c008_staleness(self) -> None:
+    def test_verified_hash_covers_claim_body_and_subject_taint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             main(["init", str(root)])
@@ -262,6 +282,7 @@ class TestConfigAndCheck(unittest.TestCase):
                 "ana_20261117_00000001",
                 kind="analysis",
                 subjects=["run_20261116_00000001"],
+                script_tracked=True,
                 metrics={"svd/rank": 32.0},
             )
             write_markdown_file(
@@ -275,40 +296,39 @@ class TestConfigAndCheck(unittest.TestCase):
                     "contradicts": [],
                     "qualifies": [],
                 },
-                "## Hypothesis & Mechanism\nLow rank.\n\n## Evidence Synthesis\n- [[ana_20261117_00000001]].\n",
+                "## Hypothesis & Mechanism\nLow rank.\n\n## Evidence Synthesis\n- **Holds:** [[ana_20261117_00000001]].\n",
             )
 
             g = ContourGraph(root)
             self.assertEqual(issues_blocking_verify(g, "clm_mech"), [])
-            main(["--root", str(root), "verify", "clm_mech", "--agent", "--note", "Clean probe"])
+            main(["--root", str(root), "verify", "clm_mech", "--human", "--note", "Clean probe"])
             g = ContourGraph(root)
-            self.assertEqual(effective_verification(g, g.claims["clm_mech"]), "agent_audited")
+            self.assertEqual(effective_verification(g, g.claims["clm_mech"]), "human_verified")
 
-            # Quarantine subject run with `bugged: true` -> propagates taint to analysis & claim
+            # Editing the Claim's Markdown body prose MUST invalidate `verified_hash`!
+            fm_c, body_c = parse_markdown_file(root / "claims" / "clm_mech.md")
+            write_markdown_file(
+                root / "claims" / "clm_mech.md",
+                fm_c,
+                body_c.replace("Low rank.", "Works universally across all models!"),
+            )
+            g = ContourGraph(root)
+            self.assertEqual(effective_verification(g, g.claims["clm_mech"]), "draft")
+            self.assertIn(RULE_STALE_VERIFICATION, {i.code for i in find_check_issues(g)})
+
+            # Re-verify, then quarantine subject run -> propagates taint & invalidates hash
+            main(["--root", str(root), "verify", "clm_mech", "--agent"])
             fm_r, body_r = parse_markdown_file(root / "runs" / "run_20261116_00000001.md")
             fm_r["bugged"] = True
             write_markdown_file(root / "runs" / "run_20261116_00000001.md", fm_r, body_r)
 
             g = ContourGraph(root)
-            self.assertEqual(effective_verification(g, g.claims["clm_mech"]), "draft")
-            codes = {i.code for i in find_check_issues(g)}
-            self.assertIn("C002", codes)
-            self.assertIn("C007", codes)
-            self.assertIn("C008", codes)
+            rules = {i.code for i in find_check_issues(g)}
+            self.assertIn(RULE_TAINTED_EVIDENCE, rules)
+            self.assertIn(RULE_OVERCLAIMED_STATUS, rules)
+            self.assertIn(RULE_STALE_VERIFICATION, rules)
             rev = find_review_items(g)
             self.assertEqual(len(rev["stale_verified"]), 1)
-
-            # Once unlinked from Claim and analysis quarantined (`bugged: true`), keeping files on disk passes cleanly!
-            fm_a, body_a = parse_markdown_file(root / "analyses" / "ana_20261117_00000001.md")
-            fm_a["bugged"] = True
-            write_markdown_file(root / "analyses" / "ana_20261117_00000001.md", fm_a, body_a)
-            fm_c, body_c = parse_markdown_file(root / "claims" / "clm_mech.md")
-            fm_c["status"] = "active"
-            fm_c["verification"] = "draft"
-            fm_c["supports"] = []
-            write_markdown_file(root / "claims" / "clm_mech.md", fm_c, body_c)
-            g = ContourGraph(root)
-            self.assertEqual(find_check_issues(g), [])
 
     def test_frontier_composes_attached_eval_and_tie_break(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -319,19 +339,11 @@ class TestConfigAndCheck(unittest.TestCase):
                 "metrics": {
                     "in1k/top1": {"direction": "max", "kind": "quality", "primary": True, "min_delta": 0.2},
                     "ade20k/miou": {"direction": "max", "kind": "quality", "primary": True, "min_delta": 0.5},
-                    "val/loss": {"direction": "min", "kind": "quality"},  # missing threshold -> C009
+                    "val/loss": {"direction": "min", "kind": "quality"},
                 },
             }))
-            _write_run(
-                root, "run_20261116_0000000a",
-                compute={"gpu_hours": 20.0, "params": 1000},
-                metrics={"in1k/top1": 80.0},
-            )
-            _write_run(
-                root, "run_20261116_0000000b",
-                compute={"gpu_hours": 5.0, "params": 1000},
-                metrics={"in1k/top1": 80.0},
-            )
+            _write_run(root, "run_20261116_0000000a", compute={"gpu_hours": 20.0}, metrics={"in1k/top1": 80.0})
+            _write_run(root, "run_20261116_0000000b", compute={"gpu_hours": 5.0}, metrics={"in1k/top1": 80.0})
             _write_analysis(
                 root, "ana_20261117_0000000e",
                 kind="eval",
@@ -340,14 +352,13 @@ class TestConfigAndCheck(unittest.TestCase):
             )
             _write_run(
                 root, "run_20261116_0000000c",
-                compute={"gpu_hours": 2.0, "params": 1000},
+                compute={"gpu_hours": 2.0},
                 code={"commit": "c1", "dirty": True},
                 metrics={"in1k/top1": 81.0},
             )
 
             g = ContourGraph(root)
-            codes = {i.code for i in find_check_issues(g)}
-            self.assertIn("C009", codes)
+            self.assertIn(RULE_UNDECLARED_METRIC, {i.code for i in find_check_issues(g)})
 
             _, _, _, pareto_in1k = compute_frontier(g, metric_filter="in1k/top1")
             self.assertEqual(pareto_in1k, {"run_20261116_0000000c"})
@@ -357,8 +368,7 @@ class TestConfigAndCheck(unittest.TestCase):
             self.assertEqual(pareto_ade, {"run_20261116_0000000b"})
 
             rev = find_review_items(g)
-            dirty_ids = {item["id"] for item in rev["dirty_frontier"]}
-            self.assertIn("run_20261116_0000000c", dirty_ids)
+            self.assertIn("run_20261116_0000000c", {item["id"] for item in rev["dirty_frontier"]})
 
 
 if __name__ == "__main__":

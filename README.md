@@ -5,16 +5,16 @@
 **Contour** maintains a clean, minimal empirical ML research state $S$ in plain Markdown and Git across four directories—**Goals** (`goals/`), **Claims** (`claims/`), **Runs** (`runs/` + `runs/configs/`), and **Analyses** (`analyses/`)—governed by explicit **Invariants** ($\mathcal{I}$) and **Operators** ($T, \mathcal{O}$). See [docs/architecture.md](docs/architecture.md) for the full specification.
 
 1. **Clean, Append-Only Evidence Layer (`runs/` + `analyses/`):**
-   - **Lean Training Runs (`runs/run_*.md`):** `from contour import Run` writes concise ~20-line Markdown records with tracked sidecar configs (`runs/configs/<id>.yaml`), compute, git provenance, artifact pointers, and metrics—computing structured diffs (`config_diff`, `config_blocks`, `code_diff`, `compute_diff`, advisory `flags`) dynamically in memory.
-   - **Post-Hoc Evals & Ad-Hoc Analyses (`analyses/ana_*.md`):** `from contour import Analysis, Eval` logs reproducible evaluations and diagnostic probes applied to existing runs/checkpoints (with scripts and plots stored in gitignored `analyses/scripts/` & `analyses/artifacts/` by default, guarded by `script_sha256`, `launch_cmd`, and automatic downstream taint propagation).
+   - **Lean Training Runs (`runs/run_*.md`):** `from contour import Run` writes concise ~20-line Markdown records with tracked sidecar configs (`runs/configs/<id>.yaml`), compute, source-only git provenance (excluding the Contour state directory itself), artifact pointers, and metrics—computing structured diffs (`config_diff`, `config_blocks`, `code_diff`, `compute_diff`, advisory `flags`) dynamically in memory.
+   - **Post-Hoc Evals & Ad-Hoc Analyses (`analyses/ana_*.md`):** `from contour import Analysis, Eval` logs reproducible evaluations and diagnostic probes applied to existing runs/checkpoints (ad-hoc scripts in gitignored `analyses/scripts/` default to `exploratory` for `qualifies`; promoting/tracking a script in Git upgrades it to `clean` for `supports`).
 2. **Three-Tier Invariants:**
-   - **Tier 1 — Structural (`ERROR`):** `C001` (schema/config/graph integrity) and `C002` (evidence usability & taint propagation when a run is quarantined with `bugged: true`).
-   - **Tier 2 — Epistemic & Quiescence (`WARN`):** `C007` (claim status honesty—clean `supports`, no unresolved `contradicts`), `C008` (`verified_hash` lock), `C003`–`C005` (synthesis work queues), `C009` (benchmark metric discipline, relaxed for ad-hoc `kind: analysis`), `C010` (non-blocking local artifact presence).
-   - **Tier 3 — Semantic (Critic + Human):** Adversarial audit (`contour verify --agent`) and selective human review (`contour review` $\to$ `contour verify --human`).
-3. **Daily Human + Agent Observables:**
-   - **Morning Briefing (`contour brief`):** One command summarizing live `running` jobs, unsynthesized work, human review queue, Goal `## Open Questions`, active claim threads, and ideation highlights.
-   - **Colleague Write-Ups (`contour report`):** Ephemeral, verified truth bundles with Integrity Banner, `--strict` gating, preliminary `--runs`/`--analyses` mode, Provenance Appendix, and `--out <dir>` portable figure export.
-   - **State-Conditioned Ideation (`contour ideate`):** Deterministic moves driven directly by diffs, tensions, open questions, and Pareto frontiers.
+   - **Tier 1 — Structural (`ERROR`):** `schema-error` and `tainted-evidence` (quarantining a flawed run with `bugged: true` automatically propagates taint downstream).
+   - **Tier 2 — Epistemic & Quiescence (`WARN`):** `overclaimed-status` (clean `supports`, no unresolved `contradicts`; `qualifies` carries no verification weight), `stale-verification` (content-hashes Claim frontmatter, **Claim Markdown body prose**, and linked evidence/subjects), plus work queues (`unsynthesized-evidence`, `todo-placeholder`, `stuck-job`, `undeclared-metric`, `missing-artifact`).
+   - **Tier 3 — Semantic (Critic + Human):** Adversarial audit (`contour verify --agent`) and selective human sign-off surfaced in `contour brief` (`contour verify --human`).
+3. **Focused Daily Observables:**
+   - **`contour brief`:** Complete morning cockpit (state counts, Goal $\to$ Claim status tree, live `running` jobs, Human Review Queue, `## Open Questions`, ideation highlights).
+   - **`contour report`:** Ephemeral, verified truth bundles with Integrity Banner, `--strict` gating, preliminary `--runs`/`--analyses` mode, Provenance Appendix, and `--out <dir>` portable figure export.
+   - **`contour ideate`:** Dedicated next-experiment moves driven directly by `config_diff`, tensions, open questions, and Pareto frontiers.
 
 ---
 
@@ -95,12 +95,11 @@ with Analysis(
 ### 3. Brief, Synthesize, Audit & Share
 ```bash
 contour brief
-contour runs --tree
-contour analyses
+contour ls runs --tree
+contour ls analyses
 contour link <run_or_ana_id> clm_qk_norm_warmup --as supports
 contour check --strict
 contour verify clm_qk_norm_warmup --agent --note "Clean control; scoped to ImageNet-1k classification."
-contour review
 contour report --goal goal_token_mixing --out /tmp/team_update
 ```
 
@@ -115,19 +114,14 @@ contour new <goal|claim|run|analysis> <slug> --title "..." [--kind eval|analysis
 contour link <run_or_ana_id> <claim_id> [--as supports|contradicts|qualifies]
 contour verify <claim_id> (--agent | --human) [--note "..."]
 
-# Invariants & Review
-contour check [--strict]
-contour review
-
-# Daily Observables & Introspection
+# Observables
 contour brief [--goal G]
-contour report [--goal G] [--claim C ...] [--runs R ...] [--analyses A ...] [--out DIR] [--strict]
-contour status
+contour ls [runs|analyses] [--tree] [--goal G] [--claim C] [--eval E] [--kind K] [--subject R] [--status S] [--control L] [--verdict V]
 contour show <node_id>
-contour runs [--tree] [--goal G] [--claim C] [--eval E] [--status S] [--control L] [--verdict V]
-contour analyses [--kind eval|analysis] [--subject R] [--claim C] [--goal G] [--status S] [--control L]
 contour compare <ctrl_id> --vs <treat_id>
 contour frontier [--metric M]
+contour check [--strict]
 contour ideate [--goal G]
+contour report [--goal G] [--claim C ...] [--runs R ...] [--analyses A ...] [--out DIR] [--strict]
 ```
 *(Pass `--json` to any command for structured output.)*

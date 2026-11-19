@@ -52,23 +52,20 @@ class TestCliAndIdeate(unittest.TestCase):
             "## Key Takeaway (TL;DR)\n- Summary.\n\n## Observations & Anomalies\n- Tail loss drops slowly.\n",
         )
 
-    def test_end_to_end_config_diff_ideate_moves_and_cli(self) -> None:
+    def test_end_to_end_ls_brief_ideate_and_compare(self) -> None:
         self._seed_run("run_20261116_00000001")
-        # Sibling 1: clean marginal changing only optim.lr (+0.30 < min_delta 0.50)
         self._seed_run(
             "run_20261116_00000002",
             parent="[[run_20261116_00000001]]",
             config={"optim": {"lr": 0.002, "wd": 0.05}},
             metrics={"val/acc": 80.30, "sys/tput": 1000.0, "attn/entropy": 1.6},
         )
-        # Sibling 2: clean marginal changing only optim.wd (+0.35 < min_delta 0.50) -> disjoint keys, sum=+0.65!
         self._seed_run(
             "run_20261116_00000003",
             parent="[[run_20261116_00000001]]",
             config={"optim": {"lr": 0.001, "wd": 0.1}},
             metrics={"val/acc": 80.35, "sys/tput": 1000.0, "attn/entropy": 1.7},
         )
-        # Multi-unit clean win changing 2 separate blocks (optim.lr + drop) for Move 4 Occam
         self._seed_run(
             "run_20261116_00000004",
             parent="[[run_20261116_00000001]]",
@@ -76,7 +73,6 @@ class TestCliAndIdeate(unittest.TestCase):
             compute={"gpu_hours": 9.5, "params": 22_000_000},
             metrics={"val/acc": 80.80, "sys/tput": 1050.0, "attn/entropy": 1.8},
         )
-        # Exploratory (dirty) positive run for Move 1
         self._seed_run(
             "run_20261116_00000005",
             parent="[[run_20261116_00000001]]",
@@ -110,17 +106,22 @@ class TestCliAndIdeate(unittest.TestCase):
         self.assertAlmostEqual(marginal_pair[0]["projected_primary_delta"], 0.65)
         self.assertEqual(marginal_pair[0]["combined_keys"], ["optim.lr", "optim.wd"])
 
-        m4_runs = {x["run"] for x in ideate_out["move_4_strip_complexity"]}
-        self.assertIn("run_20261116_00000004", m4_runs)
+        self.assertIn("run_20261116_00000004", {x["run"] for x in ideate_out["move_4_strip_complexity"]})
         self.assertEqual(ideate_out["move_6_diagnose_frontier"][0]["best_run"], "run_20261116_00000005")
 
-        runs_clean = self._run_json(["runs", "--control", "clean", "--status", "final"])
+        # Unified `ls` replaces `runs` and `analyses`
+        runs_clean = self._run_json(["ls", "runs", "--control", "clean", "--status", "final"])
         self.assertEqual(runs_clean["count"], 4)
+        ls_all = self._run_json(["ls"])
+        self.assertEqual(ls_all["counts"]["runs"], 5)
+
         cmp_out = self._run_json(["compare", "run_20261116_00000002", "--vs", "run_20261116_00000004"])
         self.assertEqual(cmp_out["verdict"], "win")
 
-        st = self._run_json(["status"])
-        self.assertEqual(st["counts"]["runs"], 5)
+        # `brief` subsumes `status` & `review`
+        br = self._run_json(["brief"])
+        self.assertEqual(br["counts"]["runs"], 5)
+        self.assertEqual(br["counts"]["goals"], 1)
         sh = self._run_json(["show", "run_20261116_00000004"])
         self.assertEqual(sh["frontmatter"]["vs_parent"]["verdict"], "win")
 
@@ -172,8 +173,7 @@ class TestCliAndIdeate(unittest.TestCase):
         )
 
         ideate_g1 = self._run_json(["ideate", "--goal", "goal_g1"])
-        m1_runs = {x["run"] for x in ideate_g1["move_1_investigate_flagged"]}
-        self.assertEqual(m1_runs, {"run_20261116_00000002"})
+        self.assertEqual({x["run"] for x in ideate_g1["move_1_investigate_flagged"]}, {"run_20261116_00000002"})
 
         frontier_out = self._run_json(["frontier"])
         self.assertEqual(frontier_out["metric"], "val/acc")

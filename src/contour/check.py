@@ -1,4 +1,4 @@
-"""`contour check`, `contour verify`, `contour review`, and Pareto `frontier`."""
+"""`contour check`, `contour verify`, review inbox helpers, and Pareto `frontier`."""
 
 from __future__ import annotations
 
@@ -33,6 +33,17 @@ ERROR = "error"
 WARN = "warn"
 STUCK_RUN_HOURS = 72.0
 
+# Human-readable invariant rule names
+RULE_SCHEMA_ERROR = "schema-error"
+RULE_TAINTED_EVIDENCE = "tainted-evidence"
+RULE_OVERCLAIMED_STATUS = "overclaimed-status"
+RULE_STALE_VERIFICATION = "stale-verification"
+RULE_UNSYNTHESIZED_EVIDENCE = "unsynthesized-evidence"
+RULE_TODO_PLACEHOLDER = "todo-placeholder"
+RULE_STUCK_JOB = "stuck-job"
+RULE_UNDECLARED_METRIC = "undeclared-metric"
+RULE_MISSING_ARTIFACT = "missing-artifact"
+
 
 @dataclass(frozen=True)
 class Issue:
@@ -46,6 +57,7 @@ class Issue:
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "rule": self.code,
             "code": self.code,
             "severity": self.severity,
             "category": self.category,
@@ -77,7 +89,7 @@ def evidence_control_level(g: ContourGraph, node: ContourNode) -> str:
 
 
 def compute_verified_hash(g: ContourGraph, claim: ContourNode) -> str:
-    """Hash of claim frontmatter (excluding verification fields) + linked runs/analyses snapshots."""
+    """Content hash of claim frontmatter (excluding verification fields), claim body prose, and linked evidence."""
     fm_part = {
         k: v
         for k, v in claim.frontmatter.items()
@@ -98,7 +110,11 @@ def compute_verified_hash(g: ContourGraph, claim: ContourNode) -> str:
                 linked_hashes[eid] = canonical_hash(_analysis_hash_snapshot(ana, g))
             else:
                 linked_hashes[eid] = "missing"
-    return canonical_hash({"claim": fm_part, "linked_evidence": linked_hashes})
+    return canonical_hash({
+        "claim": fm_part,
+        "body": claim.body.strip(),
+        "linked_evidence": linked_hashes,
+    })
 
 
 def is_verification_stale(g: ContourGraph, claim: ContourNode) -> bool:
@@ -108,7 +124,7 @@ def is_verification_stale(g: ContourGraph, claim: ContourNode) -> bool:
 
 
 def effective_verification(g: ContourGraph, claim: ContourNode) -> str:
-    """Return 'draft' if verification is stale (C008), else stored verification."""
+    """Return 'draft' if verification is stale, else stored verification."""
     if is_verification_stale(g, claim):
         return "draft"
     return claim.verification
@@ -140,7 +156,7 @@ def _check_run_cycles(g: ContourGraph, add: Any) -> None:
             pid = run.parent
             if color.get(pid) == GRAY:
                 add(Issue(
-                    "C001", ERROR, "hygiene", nid,
+                    RULE_SCHEMA_ERROR, ERROR, "hygiene", nid,
                     f"Cycle in `parent` lineage involving {nid} -> {pid}",
                     "Remove the circular `parent` reference.",
                     (nid, pid),
@@ -155,7 +171,7 @@ def _check_run_cycles(g: ContourGraph, add: Any) -> None:
 
 
 def _check_local_artifacts(g: ContourGraph, node: ContourNode, add: Any) -> None:
-    """Emit non-blocking hygiene WARN (C010) when a local relative artifact path is missing."""
+    """Emit non-blocking hygiene WARN (`missing-artifact`) when a local relative artifact path is missing."""
     for art in node.artifacts:
         raw_path = str(art.get("path") or "").strip()
         if not raw_path or is_remote_uri(raw_path):
@@ -164,7 +180,7 @@ def _check_local_artifacts(g: ContourGraph, node: ContourNode, add: Any) -> None
         candidates = [p] if p.is_absolute() else [g.root / p, g.root.parent / p]
         if not any(c.exists() for c in candidates):
             add(Issue(
-                "C010", WARN, "hygiene", node.id,
+                RULE_MISSING_ARTIFACT, WARN, "hygiene", node.id,
                 f"{node.id} references missing local artifact {raw_path!r}",
                 "Verify the artifact path (or ignore if generated on another machine).",
             ))
@@ -174,20 +190,20 @@ def find_check_issues(
     g: ContourGraph,
     now: dt.datetime | None = None,
 ) -> list[Issue]:
-    """Run all Tier-1 (ERROR) and Tier-2 (WARN) invariants."""
+    """Evaluate all Tier-1 (ERROR) and Tier-2 (WARN) invariants."""
     issues: list[Issue] = []
     add = issues.append
     now_dt = now or dt.datetime.now(dt.timezone.utc)
 
     for err in g.load_errors:
         add(Issue(
-            "C001", ERROR, "hygiene", "graph",
+            RULE_SCHEMA_ERROR, ERROR, "hygiene", "graph",
             f"Unparseable frontmatter: {err}",
             "Fix the YAML frontmatter syntax.",
         ))
     for nid in sorted(set(g.duplicate_ids)):
         add(Issue(
-            "C001", ERROR, "hygiene", nid,
+            RULE_SCHEMA_ERROR, ERROR, "hygiene", nid,
             f"Duplicate node id {nid!r}",
             "Ensure every Goal, Claim, Run, and Analysis has a unique filename stem.",
         ))
@@ -196,7 +212,7 @@ def find_check_issues(
     for goal in g.goals.values():
         if goal.status not in GOAL_STATUSES:
             add(Issue(
-                "C001", ERROR, "hygiene", goal.id,
+                RULE_SCHEMA_ERROR, ERROR, "hygiene", goal.id,
                 f"{goal.id} has invalid status {goal.status!r} (expected one of {GOAL_STATUSES})",
                 f"Set `status` to one of {GOAL_STATUSES}.",
             ))
@@ -205,13 +221,13 @@ def find_check_issues(
     for claim in g.claims.values():
         if claim.status not in CLAIM_STATUSES:
             add(Issue(
-                "C001", ERROR, "hygiene", claim.id,
+                RULE_SCHEMA_ERROR, ERROR, "hygiene", claim.id,
                 f"{claim.id} has invalid status {claim.status!r} (expected one of {CLAIM_STATUSES})",
                 f"Set `status` to one of {CLAIM_STATUSES}.",
             ))
         if claim.verification not in VERIFICATION_STATES:
             add(Issue(
-                "C001", ERROR, "hygiene", claim.id,
+                RULE_SCHEMA_ERROR, ERROR, "hygiene", claim.id,
                 f"{claim.id} has invalid verification {claim.verification!r} (expected one of {VERIFICATION_STATES})",
                 f"Set `verification` to one of {VERIFICATION_STATES}.",
             ))
@@ -219,7 +235,7 @@ def find_check_issues(
         for gid in claim.refs("goals"):
             if gid not in g.goals:
                 add(Issue(
-                    "C001", ERROR, "hygiene", claim.id,
+                    RULE_SCHEMA_ERROR, ERROR, "hygiene", claim.id,
                     f"{claim.id}.goals references missing goal {gid}",
                     "Create the goal or remove the broken wikilink.",
                     (gid,),
@@ -231,7 +247,7 @@ def find_check_issues(
             for eid in claim.refs(edge):
                 if eid in seen_edges and seen_edges[eid] != edge:
                     add(Issue(
-                        "C001", ERROR, "hygiene", claim.id,
+                        RULE_SCHEMA_ERROR, ERROR, "hygiene", claim.id,
                         f"{claim.id} lists {eid} under both `{seen_edges[eid]}` and `{edge}`",
                         f"Use `contour link {eid} {claim.id} --as <relation>` to place it under one relation.",
                         (eid,),
@@ -240,7 +256,7 @@ def find_check_issues(
                 ev = g.get_evidence(eid)
                 if ev is None:
                     add(Issue(
-                        "C001", ERROR, "hygiene", claim.id,
+                        RULE_SCHEMA_ERROR, ERROR, "hygiene", claim.id,
                         f"{claim.id} ({edge}) references missing run/analysis {eid}",
                         "Remove the broken link or restore the missing evidence file.",
                         (eid,),
@@ -248,14 +264,14 @@ def find_check_issues(
                     continue
                 if evidence_control_level(g, ev) == "invalid":
                     add(Issue(
-                        "C002", ERROR, "hygiene", claim.id,
+                        RULE_TAINTED_EVIDENCE, ERROR, "hygiene", claim.id,
                         f"{claim.id} ({edge}) links invalid/quarantined {ev.type} {eid} (status={ev.status}, bugged={ev.bugged})",
                         "Unlink it from frontmatter (you may still note it in prose as a cautionary record).",
                         (eid,),
                     ))
                 if eid not in body_links:
                     add(Issue(
-                        "C003", WARN, "hygiene", claim.id,
+                        RULE_UNSYNTHESIZED_EVIDENCE, WARN, "hygiene", claim.id,
                         f"{claim.id} links {eid} ({edge}) but does not cite [[{eid}]] in the Markdown body",
                         f"Synthesize [[{eid}]] in `## Evidence Synthesis`.",
                         (eid,),
@@ -263,18 +279,18 @@ def find_check_issues(
 
         if claim.status in ("active", "supported") and "- TODO:" in claim.body:
             add(Issue(
-                "C004", WARN, "hygiene", claim.id,
+                RULE_TODO_PLACEHOLDER, WARN, "hygiene", claim.id,
                 f"{claim.id} ({claim.status}) still contains unfilled `- TODO:` placeholder",
                 "Replace `- TODO:` with concrete hypothesis/synthesis prose.",
             ))
 
-        # C007: Claim status honesty
+        # overclaimed-status
         if claim.status == "supported":
             sup_ids = claim.refs("supports")
             con_ids = claim.refs("contradicts")
             if not sup_ids:
                 add(Issue(
-                    "C007", WARN, "epistemic", claim.id,
+                    RULE_OVERCLAIMED_STATUS, WARN, "epistemic", claim.id,
                     f"{claim.id} has status `supported` but `supports` is empty",
                     "Link clean supporting evidence (run or analysis) or set `status: active`.",
                 ))
@@ -286,14 +302,14 @@ def find_check_issues(
                     ctrl = evidence_control_level(g, ev)
                     if ctrl != "clean":
                         add(Issue(
-                            "C007", WARN, "epistemic", claim.id,
+                            RULE_OVERCLAIMED_STATUS, WARN, "epistemic", claim.id,
                             f"{claim.id} is `supported`, but `supports` evidence {eid} is `{ctrl}` (requires `clean`)",
                             f"Run `contour link {eid} {claim.id} --as qualifies` or calibrate claim `status: active`.",
                             (eid,),
                         ))
             if con_ids:
                 add(Issue(
-                    "C007", WARN, "epistemic", claim.id,
+                    RULE_OVERCLAIMED_STATUS, WARN, "epistemic", claim.id,
                     f"{claim.id} is `supported` despite unresolved `contradicts` evidence ({', '.join(con_ids)})",
                     "Set `status: active`/`falsified`, or narrow the claim and move boundary evidence to `qualifies`.",
                     tuple(con_ids),
@@ -306,16 +322,16 @@ def find_check_issues(
             )
             if not has_clean:
                 add(Issue(
-                    "C007", WARN, "epistemic", claim.id,
+                    RULE_OVERCLAIMED_STATUS, WARN, "epistemic", claim.id,
                     f"{claim.id} has status `falsified`, but no `contradicts` evidence is `clean`",
                     "Link clean contradicting evidence or set `status: active`.",
                     tuple(con_ids),
                 ))
 
-        # C008: Verification freshness lock
+        # stale-verification
         if is_verification_stale(g, claim):
             add(Issue(
-                "C008", WARN, "epistemic", claim.id,
+                RULE_STALE_VERIFICATION, WARN, "epistemic", claim.id,
                 f"{claim.id} verification ({claim.verification}) is stale (verified_hash mismatch)",
                 f"Re-audit and run `contour verify {claim.id} --agent` (or `--human`).",
             ))
@@ -330,26 +346,26 @@ def find_check_issues(
     for run in g.runs.values():
         if run.config_error:
             add(Issue(
-                "C001", ERROR, "hygiene", run.id,
+                RULE_SCHEMA_ERROR, ERROR, "hygiene", run.id,
                 f"{run.id}: {run.config_error}",
                 "Restore or fix the tracked YAML file referenced by `config_path`.",
             ))
         if run.status not in RUN_STATUSES:
             add(Issue(
-                "C001", ERROR, "hygiene", run.id,
+                RULE_SCHEMA_ERROR, ERROR, "hygiene", run.id,
                 f"{run.id} has invalid status {run.status!r} (expected one of {RUN_STATUSES})",
                 f"Set `status` to one of {RUN_STATUSES}.",
             ))
         if "bugged" in run.frontmatter and not isinstance(run.frontmatter["bugged"], bool):
             add(Issue(
-                "C001", ERROR, "hygiene", run.id,
+                RULE_SCHEMA_ERROR, ERROR, "hygiene", run.id,
                 f"{run.id}.bugged must be a boolean",
                 "Set `bugged: true` (or remove the key if valid).",
             ))
 
         if run.parent and run.parent not in g.runs:
             add(Issue(
-                "C001", ERROR, "hygiene", run.id,
+                RULE_SCHEMA_ERROR, ERROR, "hygiene", run.id,
                 f"{run.id}.parent references missing run {run.parent}",
                 "Fix or clear the `parent` wikilink.",
                 (run.parent,),
@@ -358,14 +374,14 @@ def find_check_issues(
         for ref in run.refs("motivated_by"):
             if ref not in g.all_nodes:
                 add(Issue(
-                    "C001", ERROR, "hygiene", run.id,
+                    RULE_SCHEMA_ERROR, ERROR, "hygiene", run.id,
                     f"{run.id}.motivated_by references missing node {ref}",
                     "Fix the motivated_by wikilink.",
                     (ref,),
                 ))
             elif ref in g.claims and run.is_usable_evidence and run.id not in claim_linked_evidence.get(ref, set()):
                 add(Issue(
-                    "C003", WARN, "hygiene", ref,
+                    RULE_UNSYNTHESIZED_EVIDENCE, WARN, "hygiene", ref,
                     f"{run.id} was motivated by {ref}, but {ref} has not linked it",
                     f"Run `contour link {run.id} {ref}` and synthesize it into {ref}.",
                     (run.id,),
@@ -373,7 +389,7 @@ def find_check_issues(
 
         if run.status == "final" and not run.bugged and "- TODO:" in run.body:
             add(Issue(
-                "C004", WARN, "hygiene", run.id,
+                RULE_TODO_PLACEHOLDER, WARN, "hygiene", run.id,
                 f"{run.id} (final) still contains unfilled `- TODO:` placeholder",
                 "Summarize the key takeaway in `## Key Takeaway (TL;DR)`.",
             ))
@@ -384,7 +400,7 @@ def find_check_issues(
                 age_hours = (now_dt - created).total_seconds() / 3600.0
                 if age_hours > STUCK_RUN_HOURS:
                     add(Issue(
-                        "C005", WARN, "hygiene", run.id,
+                        RULE_STUCK_JOB, WARN, "hygiene", run.id,
                         f"{run.id} has been `running` for {age_hours:.1f}h (> {STUCK_RUN_HOURS:.0f}h)",
                         "Set `status: failed` if the job died, or finish/resume the run.",
                     ))
@@ -392,13 +408,13 @@ def find_check_issues(
         for mkey in run.metrics:
             if not is_valid_metric_key(mkey):
                 add(Issue(
-                    "C009", WARN, "hygiene", run.id,
+                    RULE_UNDECLARED_METRIC, WARN, "hygiene", run.id,
                     f"{run.id} logs malformed metric key {mkey!r} (expected `<scope>/<lowercase_name>`)",
                     "Use `<scope>/<name>` metric naming in `contour.yaml` and training scripts.",
                 ))
             elif not g.config.has_metric(mkey):
                 add(Issue(
-                    "C009", WARN, "hygiene", run.id,
+                    RULE_UNDECLARED_METRIC, WARN, "hygiene", run.id,
                     f"{run.id} logs undeclared metric {mkey!r} missing from contour.yaml",
                     f"Register `{mkey}` (direction, kind, min_delta / min_rel_delta) in contour.yaml.",
                 ))
@@ -409,19 +425,19 @@ def find_check_issues(
     for ana in g.analyses.values():
         if ana.kind not in ANALYSIS_KINDS:
             add(Issue(
-                "C001", ERROR, "hygiene", ana.id,
+                RULE_SCHEMA_ERROR, ERROR, "hygiene", ana.id,
                 f"{ana.id} has invalid kind {ana.kind!r} (expected one of {ANALYSIS_KINDS})",
                 f"Set `kind` to one of {ANALYSIS_KINDS}.",
             ))
         if ana.status not in RUN_STATUSES:
             add(Issue(
-                "C001", ERROR, "hygiene", ana.id,
+                RULE_SCHEMA_ERROR, ERROR, "hygiene", ana.id,
                 f"{ana.id} has invalid status {ana.status!r} (expected one of {RUN_STATUSES})",
                 f"Set `status` to one of {RUN_STATUSES}.",
             ))
         if "bugged" in ana.frontmatter and not isinstance(ana.frontmatter["bugged"], bool):
             add(Issue(
-                "C001", ERROR, "hygiene", ana.id,
+                RULE_SCHEMA_ERROR, ERROR, "hygiene", ana.id,
                 f"{ana.id}.bugged must be a boolean",
                 "Set `bugged: true` (or remove the key if valid).",
             ))
@@ -429,7 +445,7 @@ def find_check_issues(
         for sid in ana.subjects:
             if sid not in g.runs:
                 add(Issue(
-                    "C001", ERROR, "hygiene", ana.id,
+                    RULE_SCHEMA_ERROR, ERROR, "hygiene", ana.id,
                     f"{ana.id}.subjects references missing run {sid}",
                     "Fix the subject wikilink or restore the missing run file.",
                     (sid,),
@@ -437,7 +453,7 @@ def find_check_issues(
             elif ana.is_usable_evidence and not g.runs[sid].is_usable_evidence:
                 srun = g.runs[sid]
                 add(Issue(
-                    "C002", ERROR, "hygiene", ana.id,
+                    RULE_TAINTED_EVIDENCE, ERROR, "hygiene", ana.id,
                     f"{ana.id} depends on non-usable subject run {sid} (status={srun.status}, bugged={srun.bugged})",
                     f"Quarantine {ana.id} (`bugged: true`) or re-run on a valid subject.",
                     (sid,),
@@ -446,14 +462,14 @@ def find_check_issues(
         for ref in ana.refs("motivated_by"):
             if ref not in g.all_nodes:
                 add(Issue(
-                    "C001", ERROR, "hygiene", ana.id,
+                    RULE_SCHEMA_ERROR, ERROR, "hygiene", ana.id,
                     f"{ana.id}.motivated_by references missing node {ref}",
                     "Fix the motivated_by wikilink.",
                     (ref,),
                 ))
             elif ref in g.claims and ana.is_usable_evidence and ana.id not in claim_linked_evidence.get(ref, set()):
                 add(Issue(
-                    "C003", WARN, "hygiene", ref,
+                    RULE_UNSYNTHESIZED_EVIDENCE, WARN, "hygiene", ref,
                     f"{ana.id} was motivated by {ref}, but {ref} has not linked it",
                     f"Run `contour link {ana.id} {ref} --as <relation>` and synthesize it into {ref}.",
                     (ana.id,),
@@ -461,7 +477,7 @@ def find_check_issues(
 
         if ana.status == "final" and not ana.bugged and "- TODO:" in ana.body:
             add(Issue(
-                "C004", WARN, "hygiene", ana.id,
+                RULE_TODO_PLACEHOLDER, WARN, "hygiene", ana.id,
                 f"{ana.id} (final) still contains unfilled `- TODO:` placeholder",
                 "Summarize the key finding in `## Key Takeaway (TL;DR)`.",
             ))
@@ -472,7 +488,7 @@ def find_check_issues(
                 age_hours = (now_dt - created).total_seconds() / 3600.0
                 if age_hours > STUCK_RUN_HOURS:
                     add(Issue(
-                        "C005", WARN, "hygiene", ana.id,
+                        RULE_STUCK_JOB, WARN, "hygiene", ana.id,
                         f"{ana.id} has been `running` for {age_hours:.1f}h (> {STUCK_RUN_HOURS:.0f}h)",
                         "Set `status: failed` if the job died, or finish/resume the analysis.",
                     ))
@@ -481,13 +497,13 @@ def find_check_issues(
             for mkey in ana.metrics:
                 if not is_valid_metric_key(mkey):
                     add(Issue(
-                        "C009", WARN, "hygiene", ana.id,
+                        RULE_UNDECLARED_METRIC, WARN, "hygiene", ana.id,
                         f"{ana.id} (eval) logs malformed metric key {mkey!r} (expected `<scope>/<lowercase_name>`)",
                         "Use `<scope>/<name>` metric naming in `contour.yaml` and eval scripts.",
                     ))
                 elif not g.config.has_metric(mkey):
                     add(Issue(
-                        "C009", WARN, "hygiene", ana.id,
+                        RULE_UNDECLARED_METRIC, WARN, "hygiene", ana.id,
                         f"{ana.id} (eval) logs undeclared metric {mkey!r} missing from contour.yaml",
                         f"Register `{mkey}` (direction, kind, min_delta / min_rel_delta) in contour.yaml.",
                     ))
@@ -498,7 +514,7 @@ def find_check_issues(
         kind = g.config.metric_kind(mkey)
         if kind in ("quality", "cost") and not g.config.has_threshold(mkey):
             add(Issue(
-                "C009", WARN, "hygiene", "contour.yaml",
+                RULE_UNDECLARED_METRIC, WARN, "hygiene", "contour.yaml",
                 f"Metric {mkey!r} ({kind}) in contour.yaml lacks `min_delta` / `min_rel_delta`",
                 f"Add `min_delta` and/or `min_rel_delta` for `{mkey}` in contour.yaml.",
             ))
@@ -525,7 +541,7 @@ def issues_blocking_verify(g: ContourGraph, claim_id: str) -> list[Issue]:
     all_issues = find_check_issues(g)
     blocking: list[Issue] = []
     for issue in all_issues:
-        if issue.code == "C008" and issue.node == claim_id:
+        if issue.code == RULE_STALE_VERIFICATION and issue.node == claim_id:
             continue
         applies_to_claim = (
             issue.node == claim_id
@@ -613,7 +629,7 @@ def compute_frontier(
 
 
 def find_review_items(g: ContourGraph) -> dict[str, Any]:
-    """Tier-3 selective human review inbox."""
+    """Tier-3 selective human review inbox (surfaced by `contour brief`)."""
     awaiting_signoff: list[dict[str, Any]] = []
     stale_verified: list[dict[str, Any]] = []
 

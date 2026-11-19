@@ -102,6 +102,7 @@ def _analysis_hash_snapshot(
         "artifacts": ana.artifacts,
         "script": ana.script,
         "script_sha256": ana.script_sha256,
+        "script_tracked": ana.script_tracked,
         "launch_cmd": ana.get("launch_cmd"),
         "code_commit": code.get("commit"),
         "code_dirty": bool(code.get("dirty", False)),
@@ -256,7 +257,7 @@ def compute_analysis_control_level(g: ContourGraph, ana: ContourNode) -> str:
         if srun is None or not srun.is_usable_evidence:
             return "invalid"
     code = ana.code
-    if bool(code.get("dirty", False)) or not code.get("commit"):
+    if bool(code.get("dirty", False)) or not code.get("commit") or not ana.script_tracked:
         return "exploratory"
     return "clean"
 

@@ -57,6 +57,7 @@ ANALYSIS_LOGGER_KEYS = (
     "finished_at",
     "script",
     "script_sha256",
+    "script_tracked",
     "code",
     "launch_cmd",
     "artifacts",
@@ -76,6 +77,7 @@ _OMIT_WHEN_EMPTY = frozenset({
     "artifacts",
     "script",
     "script_sha256",
+    "script_tracked",
     "launch_cmd",
     "subjects",
 })
@@ -137,12 +139,31 @@ def _git_output(args: list[str], cwd: Path | None = None) -> str | None:
         return None
 
 
-def _get_git_info(cwd: Path | None = None) -> dict[str, Any]:
-    """Collect git commit, branch, and dirty status."""
+_CONTOUR_STATE_PATHS = ("contour.yaml", "goals", "claims", "runs", "analyses")
+
+
+def _get_git_info(cwd: Path | None = None, contour_root: Path | None = None) -> dict[str, Any]:
+    """Collect git commit, branch, and source-code dirty status (excluding the Contour state dir)."""
     commit = _git_output(["rev-parse", "--short", "HEAD"], cwd=cwd)
     if not commit:
         return {"commit": None, "dirty": False}
-    porcelain = _git_output(["status", "--porcelain"], cwd=cwd) or ""
+
+    status_args = ["status", "--porcelain", "--", "."]
+    top_raw = _git_output(["rev-parse", "--show-toplevel"], cwd=cwd)
+    if top_raw and contour_root is not None:
+        top = Path(top_raw).resolve()
+        croot = contour_root.resolve()
+        try:
+            rel = croot.relative_to(top)
+            if str(rel) in ("", "."):
+                for p in _CONTOUR_STATE_PATHS:
+                    status_args.append(f":(exclude){p}")
+            else:
+                status_args.append(f":(exclude){rel.as_posix()}")
+        except ValueError:
+            pass
+
+    porcelain = _git_output(status_args, cwd=cwd) or ""
     branch = _git_output(["rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd)
     info: dict[str, Any] = {
         "commit": commit,
@@ -153,17 +174,42 @@ def _get_git_info(cwd: Path | None = None) -> dict[str, Any]:
     return info
 
 
-def _script_info(script: str | Path | None, root: Path | None = None) -> tuple[str | None, str | None]:
-    """Resolve script path (preferring relative to `root`) and compute its 16-hex SHA-256."""
+def _is_script_tracked_clean(script_path: Path, git_cwd: Path | None) -> bool:
+    """Return True iff `script_path` is tracked in Git and has no uncommitted modifications."""
+    if not script_path.is_file():
+        return False
+    top_raw = _git_output(["rev-parse", "--show-toplevel"], cwd=git_cwd or script_path.parent)
+    if not top_raw:
+        return False
+    top = Path(top_raw).resolve()
+    try:
+        rel = script_path.resolve().relative_to(top).as_posix()
+    except ValueError:
+        return False
+    tracked = _git_output(["ls-files", "--error-unmatch", "--", rel], cwd=top)
+    if not tracked:
+        return False
+    dirty = _git_output(["status", "--porcelain", "--", rel], cwd=top)
+    return not bool(dirty)
+
+
+def _script_info(
+    script: str | Path | None,
+    root: Path | None = None,
+    git_cwd: Path | None = None,
+) -> tuple[str | None, str | None, bool | None]:
+    """Resolve script path (preferring relative to `root`), its 16-hex SHA-256, and Git tracked status."""
     raw = str(script) if script is not None else (sys.argv[0] if sys.argv else "")
     raw = raw.strip()
     if not raw or raw in ("-c", "-m", "<stdin>"):
-        return None, None
+        return None, None, None
     p = Path(raw)
     resolved = p if p.is_absolute() else p.resolve()
     sha: str | None = None
+    tracked: bool | None = None
     if resolved.is_file():
         sha = hashlib.sha256(resolved.read_bytes()).hexdigest()[:16]
+        tracked = _is_script_tracked_clean(resolved, git_cwd or root)
     display = raw
     if root is not None:
         try:
@@ -173,7 +219,7 @@ def _script_info(script: str | Path | None, root: Path | None = None) -> tuple[s
                 display = str(resolved.relative_to(root.resolve().parent))
             except ValueError:
                 display = raw
-    return display, sha
+    return display, sha, tracked
 
 
 def _id_for(prefix: str, created_at: str) -> str:
@@ -359,7 +405,7 @@ class Run:
             "params": None,
         }
         git_dir = Path(git_cwd) if git_cwd else self.root
-        self.code = _get_git_info(git_dir) if self.enabled else {"commit": None, "dirty": False}
+        self.code = _get_git_info(git_dir, contour_root=self.root) if self.enabled else {"commit": None, "dirty": False}
         self.launch_cmd = launch_cmd or os.environ.get("LAUNCH_CMD") or " ".join(sys.argv)
         self._closed = False
         self.path: Path | None = None
@@ -502,8 +548,10 @@ class Analysis:
         self.notes = notes
 
         git_dir = Path(git_cwd) if git_cwd else self.root
-        self.code = _get_git_info(git_dir) if self.enabled else {"commit": None, "dirty": False}
-        self.script, self.script_sha256 = _script_info(script, self.root) if self.enabled else (None, None)
+        self.code = _get_git_info(git_dir, contour_root=self.root) if self.enabled else {"commit": None, "dirty": False}
+        self.script, self.script_sha256, self.script_tracked = (
+            _script_info(script, self.root, git_dir) if self.enabled else (None, None, None)
+        )
         self.launch_cmd = launch_cmd or os.environ.get("LAUNCH_CMD") or " ".join(sys.argv)
         self._closed = False
         self.path: Path | None = None
@@ -555,6 +603,7 @@ class Analysis:
             "finished_at": self.finished_at,
             "script": self.script,
             "script_sha256": self.script_sha256,
+            "script_tracked": self.script_tracked,
             "code": dict(self.code),
             "launch_cmd": self.launch_cmd,
             "artifacts": list(self.artifacts),

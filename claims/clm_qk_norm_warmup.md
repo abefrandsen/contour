@@ -2,7 +2,7 @@
 title: QK-RMSNorm allows 2x higher peak learning rate and 50% shorter warmup in ViT
 status: supported
 verification: agent_audited
-verified_hash: 11c51567
+verified_hash: 6ab1a5a2
 audit_note: Causal necessity ablation 5a913f62 and synthesis 88fb406c verified; warmup_epochs=5
   solo ablation still open.
 goals:
